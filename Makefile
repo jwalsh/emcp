@@ -4,7 +4,6 @@ SHELL := /bin/bash
 SENTINEL     := .sentinels
 CLAUDE       := claude --dangerously-skip-permissions -p
 EMACSCLIENT  := emacsclient
-PYTHONPATH   := src
 MANIFEST      := functions-compact.jsonl
 MANIFEST_CORE := functions-core.jsonl
 MANIFEST_FULL := emacs-functions.json
@@ -113,28 +112,27 @@ manifest: $(MANIFEST) $(MANIFEST_CORE)
 # --- test -----------------------------------------------------------------
 
 test:
-	PYTHONPATH=$(PYTHONPATH) uv run pytest tests/ -v
+	emacs --batch -Q -l src/emcp-stdio.el -l tests/test-emcp-stdio.el -f ert-run-tests-batch-and-exit
 
-test-%:
-	PYTHONPATH=$(PYTHONPATH) uv run pytest tests/test_$*.py -v
+test-integration:
+	@test -f tests/test_emcp_stdio_integration.sh && bash tests/test_emcp_stdio_integration.sh || echo "no integration test script found"
 
 # --- server ---------------------------------------------------------------
 
 run: run-core
 
-run-core: $(MANIFEST_CORE)
-	PYTHONPATH=$(PYTHONPATH) uv run python src/server.py $(MANIFEST_CORE)
-
-run-max: $(MANIFEST)
-	PYTHONPATH=$(PYTHONPATH) uv run python src/server.py $(MANIFEST)
-
-# --- pure elisp server (no python) ----------------------------------------
-
-run-elisp-core:
+run-core:
 	emacs --batch -Q -l src/emcp-stdio.el -f emcp-stdio-start
 
-run-elisp-max:
+run-max:
 	emacs --batch -l src/emcp-stdio.el -f emcp-stdio-start
+
+# --- lint -----------------------------------------------------------------
+
+lint-org:
+	emacs --batch -Q -l lisp/org-lint-batch.el -f emcp-org-lint-batch
+
+lint: lint-org
 
 # --- health ---------------------------------------------------------------
 
@@ -181,9 +179,9 @@ work:              $(SENTINEL)/work
 
 .PHONY: bootstrap generate-claude-md review-prompt wire-backlog \
         setup-memory health-check verify-bootstrap decompose work \
-        clean status graph parallel note test health run run-core run-max \
-        manifest sync init-bd init-cprr init-sb init-aq init-tools resume \
-        run-elisp-core run-elisp-max
+        clean status graph parallel note test test-integration health \
+        run run-core run-max lint lint-org \
+        manifest sync init-bd init-cprr init-sb init-aq init-tools resume
 
 parallel:
 	@$(MAKE) -j3 wire-backlog setup-memory health-check

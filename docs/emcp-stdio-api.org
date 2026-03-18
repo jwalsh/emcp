@@ -1,0 +1,67 @@
+#+TITLE: emcp-stdio.el --- API Quick Reference
+#+SUBTITLE: Function signatures grouped by layer
+#+AUTHOR: emacs-mcp-maximalist
+#+DATE: 2026-03-18
+#+OPTIONS: toc:nil num:nil ^:nil
+
+All functions and variables defined in [[file:../src/emcp-stdio.el][src/emcp-stdio.el]].
+Full documentation: [[file:emcp-stdio.org][emcp-stdio.org]].
+
+* Constants
+
+| Name | Value | Docs | Source |
+|------+-------+------+--------|
+| =emcp-stdio--protocol-version= | ="2024-11-05"= | [[file:emcp-stdio.org::#protocol-version][docs]] | [[file:../src/emcp-stdio.el::defconst emcp-stdio--protocol-version][source]] |
+| =emcp-stdio--server-name= | ="emacs-mcp-elisp"= | [[file:emcp-stdio.org::#server-name][docs]] | [[file:../src/emcp-stdio.el::defconst emcp-stdio--server-name][source]] |
+| =emcp-stdio--server-version= | ="0.1.0"= | [[file:emcp-stdio.org::#server-version][docs]] | [[file:../src/emcp-stdio.el::defconst emcp-stdio--server-version][source]] |
+
+* Variables
+
+| Name | Type | Docs | Source |
+|------+------+------+--------|
+| =emcp-stdio--tools-cache= | vector / nil | [[file:emcp-stdio.org::#tools-cache][docs]] | [[file:../src/emcp-stdio.el::defvar emcp-stdio--tools-cache][source]] |
+| =emcp-stdio-filter-fn= | function | [[file:emcp-stdio.org::#filter-fn][docs]] | [[file:../src/emcp-stdio.el::defvar emcp-stdio-filter-fn][source]] |
+| =emcp-stdio--daemon-available= | boolean | [[file:emcp-stdio.org::#daemon-available][docs]] | [[file:../src/emcp-stdio.el::defvar emcp-stdio--daemon-available][source]] |
+| =emcp-stdio--daemon-tool-defs= | list | [[file:emcp-stdio.org::#daemon-tool-defs][docs]] | [[file:../src/emcp-stdio.el::defvar emcp-stdio--daemon-tool-defs][source]] |
+
+* I/O Layer
+
+| Signature | Docs | Source |
+|-----------+------+--------|
+| =(emcp-stdio--read-line)= | [[file:emcp-stdio.org::#read-line][docs]] | [[file:../src/emcp-stdio.el::defun emcp-stdio--read-line][source]] |
+| =(emcp-stdio--send ALIST)= | [[file:emcp-stdio.org::#send][docs]] | [[file:../src/emcp-stdio.el::defun emcp-stdio--send][source]] |
+| =(emcp-stdio--respond ID RESULT)= | [[file:emcp-stdio.org::#respond][docs]] | [[file:../src/emcp-stdio.el::defun emcp-stdio--respond][source]] |
+| =(emcp-stdio--respond-error ID CODE MSG)= | [[file:emcp-stdio.org::#respond-error][docs]] | [[file:../src/emcp-stdio.el::defun emcp-stdio--respond-error][source]] |
+
+* Tool Collection
+
+| Signature | Docs | Source |
+|-----------+------+--------|
+| =(emcp-stdio--text-consumer-p SYM)= | [[file:emcp-stdio.org::#text-consumer-p][docs]] | [[file:../src/emcp-stdio.el::defun emcp-stdio--text-consumer-p][source]] |
+| =(emcp-stdio--build-tool SYM)= | [[file:emcp-stdio.org::#build-tool][docs]] | [[file:../src/emcp-stdio.el::defun emcp-stdio--build-tool][source]] |
+| =(emcp-stdio--collect-tools)= | [[file:emcp-stdio.org::#collect-tools][docs]] | [[file:../src/emcp-stdio.el::defun emcp-stdio--collect-tools][source]] |
+
+* Daemon Data Layer
+
+| Signature | Docs | Source |
+|-----------+------+--------|
+| =(emcp-stdio--check-daemon)= | [[file:emcp-stdio.org::#check-daemon][docs]] | [[file:../src/emcp-stdio.el::defun emcp-stdio--check-daemon][source]] |
+| =(emcp-stdio--daemon-eval SEXP-STRING)= | [[file:emcp-stdio.org::#daemon-eval][docs]] | [[file:../src/emcp-stdio.el::defun emcp-stdio--daemon-eval][source]] |
+| =(emcp-stdio--build-daemon-tools)= | [[file:emcp-stdio.org::#build-daemon-tools][docs]] | [[file:../src/emcp-stdio.el::defun emcp-stdio--build-daemon-tools][source]] |
+| =(emcp-stdio--daemon-build-sexp NAME ARGS)= | [[file:emcp-stdio.org::#daemon-build-sexp][docs]] | [[file:../src/emcp-stdio.el::defun emcp-stdio--daemon-build-sexp][source]] |
+| =(emcp-stdio--daemon-call NAME ARGS)= | [[file:emcp-stdio.org::#daemon-call][docs]] | [[file:../src/emcp-stdio.el::defun emcp-stdio--daemon-call][source]] |
+
+* Method Handlers
+
+| Signature | Docs | Source |
+|-----------+------+--------|
+| =(emcp-stdio--handle-initialize ID _PARAMS)= | [[file:emcp-stdio.org::#handle-initialize][docs]] | [[file:../src/emcp-stdio.el::defun emcp-stdio--handle-initialize][source]] |
+| =(emcp-stdio--handle-tools-list ID _PARAMS)= | [[file:emcp-stdio.org::#handle-tools-list][docs]] | [[file:../src/emcp-stdio.el::defun emcp-stdio--handle-tools-list][source]] |
+| =(emcp-stdio--handle-tools-call ID PARAMS)= | [[file:emcp-stdio.org::#handle-tools-call][docs]] | [[file:../src/emcp-stdio.el::defun emcp-stdio--handle-tools-call][source]] |
+
+* Dispatch and Main Loop
+
+| Signature | Docs | Source |
+|-----------+------+--------|
+| =(emcp-stdio--dispatch MSG)= | [[file:emcp-stdio.org::#dispatch][docs]] | [[file:../src/emcp-stdio.el::defun emcp-stdio--dispatch][source]] |
+| =(emcp-stdio-start)= | [[file:emcp-stdio.org::#start][docs]] | [[file:../src/emcp-stdio.el::defun emcp-stdio-start][source]] |

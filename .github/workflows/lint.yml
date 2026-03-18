@@ -1,0 +1,14 @@
+name: Lint
+
+on: [push, pull_request]
+
+jobs:
+  org-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: purcell/setup-emacs@master
+        with:
+          version: 29.4
+      - name: Lint org files
+        run: emacs --batch -Q -l lisp/org-lint-batch.el -f emcp-org-lint-batch

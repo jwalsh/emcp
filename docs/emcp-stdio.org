@@ -1,0 +1,751 @@
+#+TITLE: emcp-stdio.el --- Pure Elisp MCP Server
+#+SUBTITLE: Reference Documentation
+#+AUTHOR: emacs-mcp-maximalist
+#+DATE: 2026-03-18
+#+OPTIONS: toc:3 num:t ^:nil
+
+* Overview
+
+=emcp-stdio.el= is a pure Emacs Lisp implementation of an MCP (Model Context Protocol) server.
+It reads newline-delimited JSON-RPC 2.0 messages from stdin and writes responses to stdout,
+running Emacs in =--batch= mode.  Diagnostics go to stderr via =message=.
+
+The file eliminates the Python stack (layers L1--L5 of the original architecture) by making
+Emacs simultaneously the MCP protocol handler, the function authority, and the dispatch engine.
+See [[file:conjectures/c-008-research.md][C-008]] for the conjecture and measurements behind this collapse.
+
+** Invocation
+
+#+begin_src shell
+# Core mode: vanilla Emacs, no user init, ~779 tools
+emacs --batch -Q -l src/emcp-stdio.el -f emcp-stdio-start
+
+# Maximalist mode: user init loaded, ~3600+ tools
+emacs --batch    -l src/emcp-stdio.el -f emcp-stdio-start
+#+end_src
+
+The =-Q= flag controls which =obarray= symbols are available.  With =-Q=, only built-in
+and autoloaded functions are present.  Without it, =init.el= packages add to the obarray,
+increasing tool count.  See [[file:../CONJECTURES.md][CONJECTURES.md]] C-006 for the vanilla vs. configured measurement.
+
+** Runtime Modes
+
+| Mode       | Flag  | Tool count | Use case                          |
+|------------+-------+------------+-----------------------------------|
+| Core       | =-Q=  | ~779       | Reproducible, portable, fast      |
+| Maximalist | (none)| ~3600+     | The reductio ad absurdum demo     |
+| +Daemon    | any   | +9         | Data layer tools when daemon runs |
+
+Mode is determined by Emacs startup flags, not by code branches.  Daemon tools are
+additive: if =emacsclient= can reach a running daemon, 9 data layer tools are appended
+to the tool set regardless of mode.
+
+** Relationship to the Python Stack
+
+| Python layer        | Replaced by                  | How                                      |
+|---------------------+------------------------------+------------------------------------------|
+| =src/server.py= (L5)   | [[file:../src/emcp-stdio.el::defun emcp-stdio-start][emcp-stdio-start]]             | JSON-RPC read loop in batch mode         |
+| =src/introspect.el= (L1)| [[file:../src/emcp-stdio.el::defun emcp-stdio--collect-tools][emcp-stdio--collect-tools]]    | Live =mapatoms= at startup               |
+| =functions-compact.jsonl= (L2) | (eliminated)          | No manifest; tools from live obarray     |
+| =src/escape.py= (L3)   | (eliminated)                 | JSON args, no s-expression escaping      |
+| =src/dispatch.py= (L4) | =funcall= / [[file:../src/emcp-stdio.el::defun emcp-stdio--daemon-eval][emcp-stdio--daemon-eval]] | In-process for local; emacsclient for daemon |
+
+See [[file:../CLAUDE.md][CLAUDE.md]] Component Architecture for the full layer table.
+
+* Architecture
+
+#+begin_example
+                         +--------------------------+
+                         |  MCP Client (Claude Code)|
+                         +------------+-------------+
+                                      | stdin (JSON-RPC)
+                                      v
+                    +----------------------------------+
+                    |  emacs --batch -Q -l emcp-stdio  |
+                    |                                  |
+                    |  emcp-stdio-start                |
+                    |    |                             |
+                    |    +-- set UTF-8 encoding        |
+                    |    +-- check daemon              |
+                    |    +-- collect-tools (mapatoms)  |
+                    |    +-- build daemon tools        |
+                    |    +-- read loop:                |
+                    |         |                        |
+                    |         +-- read-line (stdin)    |
+                    |         +-- json-parse-string    |
+                    |         +-- dispatch             |
+                    |              |                   |
+                    |              +-- initialize      |
+                    |              +-- ping            |
+                    |              +-- tools/list      |
+                    |              +-- tools/call      |
+                    |                   |              |
+                    |            +------+------+       |
+                    |            |             |       |
+                    |         local          daemon    |
+                    |        (funcall)    (emacsclient)|
+                    |            |             |       |
+                    |            v             v       |
+                    |         result        result     |
+                    |            \            /        |
+                    |             +-- respond          |
+                    |                   |              |
+                    +-------------------+--------------+
+                                        | stdout (JSON-RPC)
+                                        v
+                         +--------------------------+
+                         |  MCP Client              |
+                         +--------------------------+
+#+end_example
+
+* Data Flow
+
+#+begin_example
+stdin
+  |
+  v
+read-line  -----> raw string (one JSON line)
+  |
+  v
+json-parse-string  -----> alist (id, method, params)
+  |
+  v
+dispatch
+  |
+  +--[initialize]--> respond(id, serverInfo+capabilities)
+  |
+  +--[ping]--------> respond(id, {})
+  |
+  +--[tools/list]--> respond(id, tools-cache vector)
+  |
+  +--[tools/call]--> route by name prefix:
+  |     |
+  |     +--[emcp-data-*]--> daemon-call --> daemon-eval --> emacsclient
+  |     |                                                      |
+  |     +--[other]---------> intern-soft --> eval(read(sexp)) -+
+  |                                                            |
+  |                                                     result string
+  |                                                            |
+  +-----------------------------------------------------------+
+  |
+  v
+respond(id, content[{type:"text", text:result}])
+  |
+  v
+send  -----> json-serialize --> decode-coding-string --> princ --> stdout
+#+end_example
+
+* Constants
+:PROPERTIES:
+:CUSTOM_ID: constants
+:END:
+
+** emcp-stdio--protocol-version
+:PROPERTIES:
+:CUSTOM_ID: protocol-version
+:END:
+
+- Source :: [[file:../src/emcp-stdio.el::defconst emcp-stdio--protocol-version][emcp-stdio--protocol-version]]
+- Value :: ="2024-11-05"=
+- Purpose :: MCP protocol version reported in the =initialize= response.
+
+** emcp-stdio--server-name
+:PROPERTIES:
+:CUSTOM_ID: server-name
+:END:
+
+- Source :: [[file:../src/emcp-stdio.el::defconst emcp-stdio--server-name][emcp-stdio--server-name]]
+- Value :: ="emacs-mcp-elisp"=
+- Purpose :: Server name reported in =serverInfo= during MCP handshake.
+
+** emcp-stdio--server-version
+:PROPERTIES:
+:CUSTOM_ID: server-version
+:END:
+
+- Source :: [[file:../src/emcp-stdio.el::defconst emcp-stdio--server-version][emcp-stdio--server-version]]
+- Value :: ="0.1.0"=
+- Purpose :: Server version reported in =serverInfo= during MCP handshake.
+
+* Variables
+:PROPERTIES:
+:CUSTOM_ID: variables
+:END:
+
+** emcp-stdio--tools-cache
+:PROPERTIES:
+:CUSTOM_ID: tools-cache
+:END:
+
+- Source :: [[file:../src/emcp-stdio.el::defvar emcp-stdio--tools-cache][emcp-stdio--tools-cache]]
+- Type :: Vector of alists, or =nil= before initialization
+- Purpose :: Cached MCP tool definitions built once at startup by [[file:../src/emcp-stdio.el::defun emcp-stdio--collect-tools][emcp-stdio--collect-tools]].  Returned verbatim by =tools/list=.
+- Mutated by :: [[file:../src/emcp-stdio.el::defun emcp-stdio-start][emcp-stdio-start]] (once, at startup)
+
+** emcp-stdio-filter-fn
+:PROPERTIES:
+:CUSTOM_ID: filter-fn
+:END:
+
+- Source :: [[file:../src/emcp-stdio.el::defvar emcp-stdio-filter-fn][emcp-stdio-filter-fn]]
+- Type :: Function: =(SYM) -> non-nil=
+- Default :: [[file:../src/emcp-stdio.el::defun emcp-stdio--text-consumer-p][emcp-stdio--text-consumer-p]]
+- Purpose :: Predicate controlling which =fboundp= symbols become MCP tools.  Set to =always= to expose every function (true maximalist).
+- Used by :: [[file:../src/emcp-stdio.el::defun emcp-stdio--collect-tools][emcp-stdio--collect-tools]]
+
+** emcp-stdio--daemon-available
+:PROPERTIES:
+:CUSTOM_ID: daemon-available
+:END:
+
+- Source :: [[file:../src/emcp-stdio.el::defvar emcp-stdio--daemon-available][emcp-stdio--daemon-available]]
+- Type :: Boolean (=nil= or =t=)
+- Purpose :: Set at startup; non-nil if =emacsclient= can reach a running daemon.  Guards daemon tool registration and dispatch.
+- Mutated by :: [[file:../src/emcp-stdio.el::defun emcp-stdio-start][emcp-stdio-start]] (once, at startup)
+
+** emcp-stdio--daemon-tool-defs
+:PROPERTIES:
+:CUSTOM_ID: daemon-tool-defs
+:END:
+
+- Source :: [[file:../src/emcp-stdio.el::defvar emcp-stdio--daemon-tool-defs][emcp-stdio--daemon-tool-defs]]
+- Type :: List of 4-element lists: =(NAME ARGLIST DOCSTRING HANDLER-TYPE)=
+- Purpose :: Static definition table for the 9 daemon data layer tools.  Used by [[file:../src/emcp-stdio.el::defun emcp-stdio--build-daemon-tools][emcp-stdio--build-daemon-tools]] to create MCP tool schemas and by [[file:../src/emcp-stdio.el::defun emcp-stdio--daemon-call][emcp-stdio--daemon-call]] to look up handler type.
+- HANDLER-TYPE :: =:raw= (first arg is literal sexp to eval) or =:build= (construct sexp from args via [[file:../src/emcp-stdio.el::defun emcp-stdio--daemon-build-sexp][emcp-stdio--daemon-build-sexp]])
+
+* Functions -- I/O Layer
+:PROPERTIES:
+:CUSTOM_ID: io-layer
+:END:
+
+** emcp-stdio--read-line
+:PROPERTIES:
+:CUSTOM_ID: read-line
+:END:
+
+- Source :: [[file:../src/emcp-stdio.el::defun emcp-stdio--read-line][emcp-stdio--read-line]]
+- Arguments :: None
+- Returns :: String (one line from stdin) or =nil= at EOF
+- Side effects :: Reads from stdin via =read-from-minibuffer=
+- Notes :: Uses =condition-case= to catch =end-of-file=, returning =nil= to signal the read loop to exit.  In batch mode, =read-from-minibuffer= reads a raw line from stdin without prompting.
+
+** emcp-stdio--send
+:PROPERTIES:
+:CUSTOM_ID: send
+:END:
+
+- Source :: [[file:../src/emcp-stdio.el::defun emcp-stdio--send][emcp-stdio--send]]
+- Arguments ::
+  - =ALIST= -- Association list to serialize as JSON
+- Returns :: =nil= (side-effect only)
+- Side effects :: Writes one JSON line to stdout, followed by newline, flushed
+- Notes :: Applies =decode-coding-string= to the output of =json-serialize= to convert the unibyte UTF-8 result into a multibyte Emacs string.  This prevents mojibake for non-ASCII content.  See [[#gotcha-unibyte][json-serialize unibyte gotcha]].
+
+** emcp-stdio--respond
+:PROPERTIES:
+:CUSTOM_ID: respond
+:END:
+
+- Source :: [[file:../src/emcp-stdio.el::defun emcp-stdio--respond][emcp-stdio--respond]]
+- Arguments ::
+  - =ID= -- JSON-RPC request ID (integer or string)
+  - =RESULT= -- Alist to include as the =result= field
+- Returns :: =nil= (delegates to [[file:../src/emcp-stdio.el::defun emcp-stdio--send][emcp-stdio--send]])
+- Side effects :: Writes JSON-RPC 2.0 success response to stdout
+- Output format :: ={"jsonrpc":"2.0","id":ID,"result":RESULT}=
+
+** emcp-stdio--respond-error
+:PROPERTIES:
+:CUSTOM_ID: respond-error
+:END:
+
+- Source :: [[file:../src/emcp-stdio.el::defun emcp-stdio--respond-error][emcp-stdio--respond-error]]
+- Arguments ::
+  - =ID= -- JSON-RPC request ID
+  - =CODE= -- Integer error code (e.g., =-32601= for method not found)
+  - =MSG= -- Human-readable error message string
+- Returns :: =nil= (delegates to [[file:../src/emcp-stdio.el::defun emcp-stdio--send][emcp-stdio--send]])
+- Side effects :: Writes JSON-RPC 2.0 error response to stdout
+- Output format :: ={"jsonrpc":"2.0","id":ID,"error":{"code":CODE,"message":MSG}}=
+
+* Functions -- Tool Collection
+:PROPERTIES:
+:CUSTOM_ID: tool-collection
+:END:
+
+** emcp-stdio--text-consumer-p
+:PROPERTIES:
+:CUSTOM_ID: text-consumer-p
+:END:
+
+- Source :: [[file:../src/emcp-stdio.el::defun emcp-stdio--text-consumer-p][emcp-stdio--text-consumer-p]]
+- Arguments ::
+  - =SYM= -- Symbol to test
+- Returns :: =t= if the symbol's arglist contains text-related parameter names; =nil= otherwise
+- Side effects :: None
+- Notes :: Examines the string representation of =help-function-arglist= for the regex pattern =string\|text\|str[^iua]\|buffer\|sequence\|object=.  This is the same heuristic used by =src/introspect.el=.  See [[file:../CONJECTURES.md][CONJECTURES.md]] C-002 for precision audit.  Errors are caught and return =nil=.
+
+** emcp-stdio--build-tool
+:PROPERTIES:
+:CUSTOM_ID: build-tool
+:END:
+
+- Source :: [[file:../src/emcp-stdio.el::defun emcp-stdio--build-tool][emcp-stdio--build-tool]]
+- Arguments ::
+  - =SYM= -- Symbol whose function to expose as an MCP tool
+- Returns :: Alist conforming to MCP tool definition schema
+- Side effects :: None
+- Return structure ::
+  #+begin_src elisp
+  ((name . "function-name")
+   (description . "docstring (truncated to 500 chars)")
+   (inputSchema
+    . ((type . "object")
+       (properties
+        . ((args . ((type . "array")
+                    (items . ((type . "string")))
+                    (description . "(ARG1 ARG2 ...)")))))
+       (required . ["args"]))))
+  #+end_src
+- Notes :: All tools share the same input schema: a single =args= array of strings.  The =description= field of the =args= property contains the original Elisp arglist signature.  Docstrings longer than 500 characters are truncated.
+
+** emcp-stdio--collect-tools
+:PROPERTIES:
+:CUSTOM_ID: collect-tools
+:END:
+
+- Source :: [[file:../src/emcp-stdio.el::defun emcp-stdio--collect-tools][emcp-stdio--collect-tools]]
+- Arguments :: None
+- Returns :: Vector of MCP tool definition alists
+- Side effects :: Walks the entire =obarray= via =mapatoms=
+- Filter criteria ::
+  1. Symbol must be =fboundp= (has a function binding)
+  2. Symbol must pass [[file:../src/emcp-stdio.el::defvar emcp-stdio-filter-fn][emcp-stdio-filter-fn]] predicate
+  3. Symbol name must not start with ="emcp-stdio-"= (excludes server internals)
+- Notes :: Called once at startup.  Result is stored in [[file:../src/emcp-stdio.el::defvar emcp-stdio--tools-cache][emcp-stdio--tools-cache]].
+
+* Functions -- Daemon Data Layer
+:PROPERTIES:
+:CUSTOM_ID: daemon-layer
+:END:
+
+** emcp-stdio--check-daemon
+:PROPERTIES:
+:CUSTOM_ID: check-daemon
+:END:
+
+- Source :: [[file:../src/emcp-stdio.el::defun emcp-stdio--check-daemon][emcp-stdio--check-daemon]]
+- Arguments :: None
+- Returns :: Non-nil if =emacsclient --eval "(emacs-pid)"= exits with code 0
+- Side effects :: Spawns =emacsclient= subprocess; output is discarded
+
+** emcp-stdio--daemon-eval
+:PROPERTIES:
+:CUSTOM_ID: daemon-eval
+:END:
+
+- Source :: [[file:../src/emcp-stdio.el::defun emcp-stdio--daemon-eval][emcp-stdio--daemon-eval]]
+- Arguments ::
+  - =SEXP-STRING= -- String containing an Elisp s-expression to evaluate
+- Returns :: Result string from the daemon (trimmed, diagnostics filtered)
+- Side effects :: Spawns =emacsclient --eval= subprocess
+- Error :: Signals =error= if =emacsclient= exits with non-zero code
+- Notes :: Filters lines containing ="emacsclient:"= from the output.  This handles TCP socket warnings and other diagnostic noise.  Same pattern as =dispatch.py=.  See [[#gotcha-emacsclient][emacsclient diagnostic filtering gotcha]].
+
+** emcp-stdio--build-daemon-tools
+:PROPERTIES:
+:CUSTOM_ID: build-daemon-tools
+:END:
+
+- Source :: [[file:../src/emcp-stdio.el::defun emcp-stdio--build-daemon-tools][emcp-stdio--build-daemon-tools]]
+- Arguments :: None
+- Returns :: List of MCP tool definition alists (one per daemon tool)
+- Side effects :: None
+- Notes :: Transforms [[file:../src/emcp-stdio.el::defvar emcp-stdio--daemon-tool-defs][emcp-stdio--daemon-tool-defs]] into the same schema format as [[file:../src/emcp-stdio.el::defun emcp-stdio--build-tool][emcp-stdio--build-tool]].
+
+** emcp-stdio--daemon-build-sexp
+:PROPERTIES:
+:CUSTOM_ID: daemon-build-sexp
+:END:
+
+- Source :: [[file:../src/emcp-stdio.el::defun emcp-stdio--daemon-build-sexp][emcp-stdio--daemon-build-sexp]]
+- Arguments ::
+  - =NAME= -- Tool name string (e.g., ="emcp-data-buffer-list"=)
+  - =ARGS= -- List of string arguments from JSON
+- Returns :: String containing a complete Elisp s-expression for =emacsclient --eval=
+- Side effects :: None
+- Error :: Signals =error= for unknown tool names
+- Notes :: Uses =pcase= with one branch per daemon tool.  Constructs s-expressions using =concat= and =prin1-to-string= to avoid quoting issues.  This is the security-critical function for daemon tools -- all user-supplied strings are passed through =prin1-to-string= before interpolation.
+
+** emcp-stdio--daemon-call
+:PROPERTIES:
+:CUSTOM_ID: daemon-call
+:END:
+
+- Source :: [[file:../src/emcp-stdio.el::defun emcp-stdio--daemon-call][emcp-stdio--daemon-call]]
+- Arguments ::
+  - =NAME= -- Tool name string
+  - =ARGS= -- List of string arguments
+- Returns :: Result string from daemon evaluation
+- Side effects :: Spawns =emacsclient= subprocess (via [[file:../src/emcp-stdio.el::defun emcp-stdio--daemon-eval][emcp-stdio--daemon-eval]])
+- Notes :: Looks up handler type in [[file:../src/emcp-stdio.el::defvar emcp-stdio--daemon-tool-defs][emcp-stdio--daemon-tool-defs]].  For =:raw= tools, passes the first arg directly to [[file:../src/emcp-stdio.el::defun emcp-stdio--daemon-eval][emcp-stdio--daemon-eval]].  For =:build= tools, constructs the sexp via [[file:../src/emcp-stdio.el::defun emcp-stdio--daemon-build-sexp][emcp-stdio--daemon-build-sexp]] first.
+
+* Functions -- Method Handlers
+:PROPERTIES:
+:CUSTOM_ID: method-handlers
+:END:
+
+** emcp-stdio--handle-initialize
+:PROPERTIES:
+:CUSTOM_ID: handle-initialize
+:END:
+
+- Source :: [[file:../src/emcp-stdio.el::defun emcp-stdio--handle-initialize][emcp-stdio--handle-initialize]]
+- Arguments ::
+  - =ID= -- JSON-RPC request ID
+  - =_PARAMS= -- Ignored (MCP initialize params)
+- Returns :: =nil= (responds via [[file:../src/emcp-stdio.el::defun emcp-stdio--respond][emcp-stdio--respond]])
+- Side effects :: Writes =initialize= response to stdout
+- Response structure ::
+  #+begin_src elisp
+  ((protocolVersion . "2024-11-05")
+   (capabilities . ((tools . {})))
+   (serverInfo . ((name . "emacs-mcp-elisp")
+                  (version . "0.1.0"))))
+  #+end_src
+- Notes :: The =tools= capability is an empty hash table, which serializes to ={}= in JSON.  This advertises tool support without listing specific tools (per MCP spec, tools are listed via =tools/list=).
+
+** emcp-stdio--handle-tools-list
+:PROPERTIES:
+:CUSTOM_ID: handle-tools-list
+:END:
+
+- Source :: [[file:../src/emcp-stdio.el::defun emcp-stdio--handle-tools-list][emcp-stdio--handle-tools-list]]
+- Arguments ::
+  - =ID= -- JSON-RPC request ID
+  - =_PARAMS= -- Ignored
+- Returns :: =nil= (responds via [[file:../src/emcp-stdio.el::defun emcp-stdio--respond][emcp-stdio--respond]])
+- Side effects :: Writes =tools/list= response to stdout containing [[file:../src/emcp-stdio.el::defvar emcp-stdio--tools-cache][emcp-stdio--tools-cache]]
+
+** emcp-stdio--handle-tools-call
+:PROPERTIES:
+:CUSTOM_ID: handle-tools-call
+:END:
+
+- Source :: [[file:../src/emcp-stdio.el::defun emcp-stdio--handle-tools-call][emcp-stdio--handle-tools-call]]
+- Arguments ::
+  - =ID= -- JSON-RPC request ID
+  - =PARAMS= -- Alist with =name= (tool name string) and =arguments= (alist with =args= vector)
+- Returns :: =nil= (responds via [[file:../src/emcp-stdio.el::defun emcp-stdio--respond][emcp-stdio--respond]])
+- Side effects :: Evaluates Elisp code (local tools) or spawns =emacsclient= (daemon tools); writes response to stdout
+- Dispatch logic ::
+  1. If =name= starts with ="emcp-data-"=: routes to [[file:../src/emcp-stdio.el::defun emcp-stdio--daemon-call][emcp-stdio--daemon-call]] (requires daemon)
+  2. Otherwise: constructs s-expression string from name and args, evaluates via =eval(read(...))=
+- Error handling :: All errors are caught and returned as MCP content with ="error: ..."= text (not as JSON-RPC errors), keeping the response within MCP tool call semantics.
+- Security note :: Local tool dispatch uses =eval(read(sexp-str))= where =sexp-str= is built from the tool name (an interned symbol) and =%S=-formatted args.  The =%S= format provides basic quoting but this is not a hardened security boundary.
+
+* Functions -- Dispatch and Main Loop
+:PROPERTIES:
+:CUSTOM_ID: dispatch-main
+:END:
+
+** emcp-stdio--dispatch
+:PROPERTIES:
+:CUSTOM_ID: dispatch
+:END:
+
+- Source :: [[file:../src/emcp-stdio.el::defun emcp-stdio--dispatch][emcp-stdio--dispatch]]
+- Arguments ::
+  - =MSG= -- Parsed JSON-RPC message as alist (keys: =id=, =method=, =params=)
+- Returns :: =nil=
+- Side effects :: Calls the appropriate handler, which writes to stdout
+- Routing table ::
+  | Condition         | Handler                          |
+  |-------------------+----------------------------------|
+  | =id= is nil       | Swallowed (notification)         |
+  | ="initialize"=     | [[file:../src/emcp-stdio.el::defun emcp-stdio--handle-initialize][emcp-stdio--handle-initialize]]    |
+  | ="ping"=           | Respond with empty object        |
+  | ="tools/list"=     | [[file:../src/emcp-stdio.el::defun emcp-stdio--handle-tools-list][emcp-stdio--handle-tools-list]]    |
+  | ="tools/call"=     | [[file:../src/emcp-stdio.el::defun emcp-stdio--handle-tools-call][emcp-stdio--handle-tools-call]]    |
+  | other             | JSON-RPC error =-32601=           |
+
+** emcp-stdio-start
+:PROPERTIES:
+:CUSTOM_ID: start
+:END:
+
+- Source :: [[file:../src/emcp-stdio.el::defun emcp-stdio-start][emcp-stdio-start]]
+- Arguments :: None
+- Returns :: Does not return until stdin closes (EOF)
+- Side effects ::
+  1. Sets language environment to UTF-8
+  2. Sets =coding-system-for-read= and =coding-system-for-write= to =utf-8=
+  3. Configures binary mode on stdin/stdout (if =set-binary-mode= is available)
+  4. Probes for running daemon via [[file:../src/emcp-stdio.el::defun emcp-stdio--check-daemon][emcp-stdio--check-daemon]]
+  5. Builds [[file:../src/emcp-stdio.el::defvar emcp-stdio--tools-cache][emcp-stdio--tools-cache]] from obarray + daemon tools
+  6. Logs tool count to stderr
+  7. Enters blocking read loop on stdin
+- Notes :: This is the entry point.  Called with =-f emcp-stdio-start= on the Emacs command line.  The read loop calls [[file:../src/emcp-stdio.el::defun emcp-stdio--read-line][emcp-stdio--read-line]] and parses each line as JSON.  Parse errors and dispatch errors are logged to stderr but do not terminate the loop.
+
+* Daemon Tools Reference
+:PROPERTIES:
+:CUSTOM_ID: daemon-tools
+:END:
+
+All daemon tools are defined in [[file:../src/emcp-stdio.el::defvar emcp-stdio--daemon-tool-defs][emcp-stdio--daemon-tool-defs]] and dispatched via
+[[file:../src/emcp-stdio.el::defun emcp-stdio--daemon-call][emcp-stdio--daemon-call]].  S-expressions are built by [[file:../src/emcp-stdio.el::defun emcp-stdio--daemon-build-sexp][emcp-stdio--daemon-build-sexp]].
+
+| Tool name               | Args                      | Handler | Return format                       |
+|--------------------------+---------------------------+---------+-------------------------------------|
+| =emcp-data-eval=         | =sexp-string=              | =:raw=   | Raw eval result as string           |
+| =emcp-data-buffer-list=  | (none)                    | =:build= | =name\tfilename= per line            |
+| =emcp-data-buffer-read=  | =buffer-name=              | =:build= | Full buffer contents as string      |
+| =emcp-data-buffer-insert= | =buffer-name=, =text=      | =:build= | ="inserted N chars"=                 |
+| =emcp-data-find-file=    | =filename=                 | =:build= | Buffer name string                  |
+| =emcp-data-org-headings= | =filename=                 | =:build= | =level\tstate\ttitle\ttags= per line  |
+| =emcp-data-org-set-todo= | =filename=, =heading=, =new-state= | =:build= | ="set HEADING to STATE"=             |
+| =emcp-data-org-table=    | =filename=, =table-name=    | =:build= | Tab-separated rows, =---= for hlines |
+| =emcp-data-org-capture=  | =file=, =heading=, =body=    | =:build= | ="captured"= or ="captured at top level"= |
+
+*** emcp-data-eval
+
+The raw query interface.  Evaluates arbitrary Elisp in the running daemon.  This is the most powerful and least safe daemon tool.
+
+#+begin_src elisp
+;; sexp template (passed directly to emacsclient --eval):
+(car args)  ; the sexp-string argument, evaluated as-is
+#+end_src
+
+*** emcp-data-buffer-list
+
+Lists all open buffers with their associated filenames.
+
+#+begin_src elisp
+;; sexp template:
+(mapconcat (lambda (b)
+             (format "%s\t%s" (buffer-name b)
+                     (or (buffer-file-name b) "")))
+           (buffer-list) "\n")
+#+end_src
+
+*** emcp-data-buffer-read
+
+Reads the full contents of a named buffer.
+
+#+begin_src elisp
+;; sexp template:
+(with-current-buffer BUFFER-NAME
+  (buffer-substring-no-properties (point-min) (point-max)))
+#+end_src
+
+*** emcp-data-buffer-insert
+
+Inserts text at the end of a named buffer.
+
+#+begin_src elisp
+;; sexp template:
+(with-current-buffer BUFFER-NAME
+  (goto-char (point-max))
+  (insert TEXT)
+  (format "inserted %d chars" (length TEXT)))
+#+end_src
+
+*** emcp-data-find-file
+
+Opens a file in the daemon, returning the buffer name.
+
+#+begin_src elisp
+;; sexp template:
+(buffer-name (find-file-noselect FILENAME))
+#+end_src
+
+*** emcp-data-org-headings
+
+Extracts all org headings with level, TODO state, title, and tags.
+
+#+begin_src elisp
+;; sexp template:
+(progn (require 'org)
+  (with-current-buffer (find-file-noselect FILENAME)
+    (mapconcat (lambda (c) (mapconcat #'identity c "\t"))
+               (org-map-entries
+                (lambda () (let ((h (org-heading-components)))
+                             (list (make-string (nth 0 h) ?*)
+                                   (or (nth 2 h) "-")
+                                   (nth 4 h)
+                                   (or (nth 5 h) "")))))
+               "\n")))
+#+end_src
+
+*** emcp-data-org-set-todo
+
+Sets the TODO state of a heading found by regex search.
+
+#+begin_src elisp
+;; sexp template:
+(progn (require 'org)
+  (with-current-buffer (find-file-noselect FILENAME)
+    (goto-char (point-min))
+    (re-search-forward (concat "^\\*+ .*" (regexp-quote HEADING)))
+    (org-todo NEW-STATE)
+    (save-buffer)
+    (format "set %s to %s" HEADING NEW-STATE)))
+#+end_src
+
+*** emcp-data-org-table
+
+Extracts an org table by searching for its name/label.
+
+#+begin_src elisp
+;; sexp template:
+(progn (require 'org)
+  (with-current-buffer (find-file-noselect FILENAME)
+    (goto-char (point-min))
+    (search-forward TABLE-NAME)
+    (forward-line 1)
+    (mapconcat (lambda (row)
+                 (if (eq row 'hline) "---"
+                   (mapconcat #'identity row "\t")))
+               (org-table-to-lisp) "\n")))
+#+end_src
+
+*** emcp-data-org-capture
+
+Appends a new org entry under a heading, or creates a top-level heading if not found.
+
+#+begin_src elisp
+;; sexp template:
+(progn (require 'org)
+  (with-current-buffer (find-file-noselect FILE)
+    (goto-char (point-min))
+    (if (re-search-forward (concat "^\\*+ " (regexp-quote HEADING)) nil t)
+        (progn (org-end-of-subtree t)
+               (insert "\n** " BODY "\n")
+               (save-buffer) "captured")
+      (progn (goto-char (point-max))
+             (insert "\n* " HEADING "\n" BODY "\n")
+             (save-buffer) "captured at top level"))))
+#+end_src
+
+* Known Gotchas
+:PROPERTIES:
+:CUSTOM_ID: gotchas
+:END:
+
+** json-serialize unibyte output
+:PROPERTIES:
+:CUSTOM_ID: gotcha-unibyte
+:END:
+
+=json-serialize= returns a *unibyte* string containing raw UTF-8 bytes.  In batch mode,
+=princ= on a unibyte string may interpret the bytes as Latin-1, producing mojibake for
+any non-ASCII content.
+
+The fix in [[file:../src/emcp-stdio.el::defun emcp-stdio--send][emcp-stdio--send]]:
+
+#+begin_src elisp
+(princ (decode-coding-string (json-serialize alist) 'utf-8))
+#+end_src
+
+This converts the raw UTF-8 bytes into a proper multibyte Emacs string before output.
+See [[file:reference/parsing-json.md][parsing-json reference]] and [[file:reference/coding-system-basics.md][coding-system-basics reference]].
+
+** emacsclient diagnostic filtering
+:PROPERTIES:
+:CUSTOM_ID: gotcha-emacsclient
+:END:
+
+When the daemon is reached via TCP (rather than Unix socket), =emacsclient= may emit
+diagnostic lines like =Waiting for Emacs...= to its stdout.  These lines are mixed
+into the eval result.
+
+[[file:../src/emcp-stdio.el::defun emcp-stdio--daemon-eval][emcp-stdio--daemon-eval]] filters any line containing ="emacsclient:"= before
+returning the result.  This mirrors the same filtering in =src/dispatch.py=.
+
+** Batch mode encoding setup
+:PROPERTIES:
+:CUSTOM_ID: gotcha-encoding
+:END:
+
+Emacs batch mode does not automatically use UTF-8 for stdio.  [[file:../src/emcp-stdio.el::defun emcp-stdio-start][emcp-stdio-start]]
+explicitly configures:
+
+1. =set-language-environment "UTF-8"= -- sets default coding systems
+2. =coding-system-for-read= / =coding-system-for-write= to =utf-8=
+3. =set-binary-mode= on stdin/stdout set to =nil= (text mode, not raw binary)
+
+Without step 3, some platforms may use raw binary mode which bypasses encoding
+entirely.  See [[file:reference/batch-mode.md][batch-mode reference]].
+
+** read-from-minibuffer in batch mode
+:PROPERTIES:
+:CUSTOM_ID: gotcha-minibuffer
+:END:
+
+[[file:../src/emcp-stdio.el::defun emcp-stdio--read-line][emcp-stdio--read-line]] uses =read-from-minibuffer= to read stdin.  In batch mode,
+this function reads a raw line from stdin (no prompt, no minibuffer display).
+The empty string prompt =""= is required but not displayed.
+
+** eval(read(...)) for local tool dispatch
+:PROPERTIES:
+:CUSTOM_ID: gotcha-eval-read
+:END:
+
+[[file:../src/emcp-stdio.el::defun emcp-stdio--handle-tools-call][emcp-stdio--handle-tools-call]] constructs an s-expression string and evaluates it
+via =eval(read(...))= rather than using =funcall= directly.  This means arguments
+arrive as strings (from JSON) and are interpolated with =%S= formatting.  While =%S=
+provides Elisp-level quoting, this path is less safe than direct =funcall= with
+properly typed arguments.  For daemon tools, =prin1-to-string= provides equivalent
+quoting in [[file:../src/emcp-stdio.el::defun emcp-stdio--daemon-build-sexp][emcp-stdio--daemon-build-sexp]].
+
+** Notification handling
+:PROPERTIES:
+:CUSTOM_ID: gotcha-notifications
+:END:
+
+JSON-RPC notifications have no =id= field.  [[file:../src/emcp-stdio.el::defun emcp-stdio--dispatch][emcp-stdio--dispatch]] swallows them
+silently.  This correctly handles =notifications/initialized= but means any
+malformed request missing an =id= is silently dropped.
+
+* Invariants
+:PROPERTIES:
+:CUSTOM_ID: invariants
+:END:
+
+The following invariants must hold for correct operation:
+
+1. *JSON-RPC 2.0 framing* -- Each message is a single line of valid JSON.  No embedded newlines within a message.  Messages are delimited by =\n=.
+
+2. *UTF-8 encoding* -- All stdin/stdout data is UTF-8 encoded.  The server sets this explicitly at startup.  Non-UTF-8 input will cause parse errors.
+
+3. *One-line-per-message* -- [[file:../src/emcp-stdio.el::defun emcp-stdio--read-line][emcp-stdio--read-line]] reads exactly one line.  [[file:../src/emcp-stdio.el::defun emcp-stdio--send][emcp-stdio--send]] writes exactly one line (via =terpri=).  No Content-Length headers are used (unlike LSP).
+
+4. *Tools cache immutability* -- [[file:../src/emcp-stdio.el::defvar emcp-stdio--tools-cache][emcp-stdio--tools-cache]] is built once at startup and never modified.  =tools/list= returns the same result for the lifetime of the server process.
+
+5. *Symbol interning* -- Local tool dispatch requires the tool name to resolve via =intern-soft= to an =fboundp= symbol.  If the obarray is modified after startup (unlikely in batch mode), a tool listed in =tools/list= could become un-callable.
+
+6. *Daemon stability* -- Daemon tools assume the daemon remains reachable after the startup check.  If the daemon exits mid-session, daemon tool calls will fail with =emacsclient= errors.
+
+7. *Argument type* -- All tool arguments arrive as JSON strings (=type: "array"= of =type: "string"=).  Functions expecting non-string arguments (integers, symbols) receive string representations.  The =eval(read(...))= path in local dispatch handles some coercion via the Elisp reader, but daemon tool sexp builders assume string arguments.
+
+8. *No concurrent requests* -- The read loop is single-threaded and sequential.  Each message is fully processed before the next is read.  No request pipelining or out-of-order responses.
+
+9. *Stderr for diagnostics only* -- =message= output goes to stderr in batch mode.  Stdout is exclusively for JSON-RPC responses.  Mixing diagnostic output into stdout would corrupt the protocol stream.
+
+10. *Server internals excluded* -- [[file:../src/emcp-stdio.el::defun emcp-stdio--collect-tools][emcp-stdio--collect-tools]] explicitly filters out symbols starting with ="emcp-stdio-"=.  This prevents the server from exposing itself as a tool.
+
+* Cross-References
+:PROPERTIES:
+:CUSTOM_ID: cross-references
+:END:
+
+- Project specification :: [[file:../CLAUDE.md][CLAUDE.md]]
+- Conjecture that motivated this file :: [[file:conjectures/c-008-research.md][C-008: Pure Elisp MCP Server Replaces Python Shim]]
+- All conjectures :: [[file:../CONJECTURES.md][CONJECTURES.md]]
+- Project overview :: [[file:../README.org][README.org]]
+- Batch mode reference :: [[file:reference/batch-mode.md][batch-mode.md]]
+- JSON parsing reference :: [[file:reference/parsing-json.md][parsing-json.md]]
+- Coding systems reference :: [[file:reference/coding-system-basics.md][coding-system-basics.md]]
+- Symbol introspection reference :: [[file:reference/symbol-components.md][symbol-components.md]]
+- Synchronous processes reference :: [[file:reference/synchronous-processes.md][synchronous-processes.md]]
+- API quick reference :: [[file:emcp-stdio-api.org][emcp-stdio-api.org]]
