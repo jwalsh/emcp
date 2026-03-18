@@ -13,6 +13,7 @@ Detailed research in `docs/conjectures/c-NNN-research.md`.
 | C-004 | Non-ASCII survives full round trip | Confirmed | 2026-03-18: 14 character classes tested (CJK, emoji, ZWJ families, Arabic, Thai, Korean, combining, supplementary plane, flags). All byte-identical round trips via hex comparison |
 | C-005 | Maximalist manifest causes measurable init latency vs core | Confirmed | 2026-03-18: core=0.1ms (60 tools), 780 tools=1.7ms, 3.6k extrapolated=~10ms. Token cost is the real impact: core ~5.7k tokens vs maximalist ~341k tokens |
 | C-006 | Vanilla Emacs exposes substantially fewer functions than configured | Confirmed | 2026-03-18: vanilla (-Q) = 8460, configured (init.el) = 10040. Delta = 1580 (18.7%). Same C primitives (1336); difference is Elisp-defined functions |
+| C-008 | Pure Elisp MCP server can fully replace the Python shim | Confirmed (prototype) | 2026-03-18: `src/emcp-stdio.el` implements full MCP JSON-RPC over stdio in ~250 lines. `emacs --batch -Q` produces 779 tools + 9 daemon data layer tools. Passes initialize, tools/list, tools/call. Unicode round-trip confirmed. Eliminates Python stack entirely. See `docs/conjectures/c-008-research.md` |
 
 ## Measurement Details
 
@@ -154,6 +155,56 @@ Implications for the project:
 - The 780-line manifest (current) represents ~9.2% of vanilla functions
   and ~7.8% of configured functions
 
+### C-008: Pure Elisp MCP server replaces Python shim (Confirmed, prototype 2026-03-18)
+
+**Claim**: The Python MCP shim can be fully replaced by a pure Elisp MCP
+server running in batch mode, with no loss of protocol compliance or
+functionality.
+
+**2026-03-18 measurement**:
+
+`src/emcp-stdio.el` implements a complete MCP JSON-RPC 2.0 server over
+stdio in approximately 250 lines of Emacs Lisp.
+
+| Metric | Value |
+|--------|-------|
+| Implementation size | ~250 lines Elisp |
+| Tool count (vanilla `-Q`) | 779 |
+| Daemon data layer tools | 9 (when daemon detected) |
+| Total tools (with daemon) | 788 |
+| Protocol methods passing | `initialize`, `tools/list`, `tools/call` |
+| Unicode round-trip | Confirmed (NAIVE RESUME CAFE with diacritics, emoji) |
+
+**Invocation**: `emacs --batch -Q -l src/emcp-stdio.el -f emcp-stdio-start`
+
+**What it eliminates**: the entire Python stack — `server.py`, `escape.py`,
+`dispatch.py`, `uv`, the `mcp` Python SDK, and the manifest build artifact
+(`functions-compact.jsonl`). Introspection happens live at startup via
+`mapatoms`, not from a pre-built JSONL file.
+
+**What remains**: `emacsclient` is still used for daemon data layer tools
+(buffer listing, file operations on the running daemon), but local
+function tools (string manipulation, type predicates, etc.) execute
+directly in the batch Emacs process with no IPC.
+
+**Gotchas found**:
+- `json-serialize` returns unibyte UTF-8 strings in batch mode; requires
+  `decode-coding-string` before `princ` to avoid mojibake on stdout
+- `emacsclient` TCP connections emit diagnostic lines that must be
+  filtered before parsing — same issue as `dispatch.py` already handles
+
+**Architectural implications**:
+- The foundational axiom ("Emacs tells the server what it can do") is
+  strengthened: the server IS Emacs, so introspection locality is trivially
+  satisfied
+- The manifest format invariant becomes unnecessary — there is no manifest;
+  tools are registered directly from `obarray` at startup
+- The security boundary shifts from `escape.py` (Python string escaping)
+  to Elisp's own `read`/`prin1-to-string` round-trip
+- Build order simplifies: no L2 (manifest) or L3 (escape) layers needed
+
+Full analysis: `docs/conjectures/c-008-research.md`.
+
 ## Instrumentation Hooks
 
 - **C-001, C-005**: `EMCP_TRACE=1` environment variable in `server.py`
@@ -162,3 +213,6 @@ Implications for the project:
 - **C-002**: Random sampling from `functions-compact.jsonl` (manual)
 - **C-006**: `emacsclient --eval` with `mapatoms`/`fboundp` counting against
   daemons started with `-Q` vs normal init
+- **C-008**: `emacs --batch -Q -l src/emcp-stdio.el -f emcp-stdio-start` with
+  JSON-RPC requests piped to stdin; tool count from `tools/list`, Unicode
+  correctness via `tools/call` with non-ASCII arguments
