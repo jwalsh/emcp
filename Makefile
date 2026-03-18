@@ -128,6 +128,14 @@ run-core: $(MANIFEST_CORE)
 run-max: $(MANIFEST)
 	PYTHONPATH=$(PYTHONPATH) uv run python src/server.py $(MANIFEST)
 
+# --- pure elisp server (no python) ----------------------------------------
+
+run-elisp-core:
+	emacs --batch -Q -l src/emcp-stdio.el -f emcp-stdio-start
+
+run-elisp-max:
+	emacs --batch -l src/emcp-stdio.el -f emcp-stdio-start
+
 # --- health ---------------------------------------------------------------
 
 health:
@@ -174,7 +182,8 @@ work:              $(SENTINEL)/work
 .PHONY: bootstrap generate-claude-md review-prompt wire-backlog \
         setup-memory health-check verify-bootstrap decompose work \
         clean status graph parallel note test health run run-core run-max \
-        manifest sync init-bd init-cprr init-sb init-aq init-tools resume
+        manifest sync init-bd init-cprr init-sb init-aq init-tools resume \
+        run-elisp-core run-elisp-max
 
 parallel:
 	@$(MAKE) -j3 wire-backlog setup-memory health-check

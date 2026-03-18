@@ -6,20 +6,26 @@
 [[https://github.com/jwalsh/emacs-mcp-maximalist/actions][https://img.shields.io/github/actions/workflow/status/jwalsh/emacs-mcp-maximalist/test.yml.svg?branch=main&style=flat-square&logo=github&label=tests]]
 [[https://github.com/jwalsh/emacs-mcp-maximalist/blob/main/LICENSE][https://img.shields.io/badge/license-Apache--2.0-blue.svg?style=flat-square]]
 [[https://github.com/jwalsh/emacs-mcp-maximalist/issues][https://img.shields.io/github/issues/jwalsh/emacs-mcp-maximalist.svg?style=flat-square]]
-[[https://www.python.org/downloads/][https://img.shields.io/badge/python-%E2%89%A53.11-3776AB.svg?style=flat-square&logo=python&logoColor=white]]
-[[https://www.gnu.org/software/emacs/][https://img.shields.io/badge/emacs-daemon-7F5AB6.svg?style=flat-square&logo=gnuemacs&logoColor=white]]
+[[https://www.gnu.org/software/emacs/][https://img.shields.io/badge/emacs-%E2%89%A528-7F5AB6.svg?style=flat-square&logo=gnuemacs&logoColor=white]]
 
 * What
 
 An MCP server that exposes the full Emacs =obarray= — every text-consuming
-function — as MCP tools, introspected at runtime from a live daemon.
+function — as MCP tools, introspected at runtime from the live process.
 
-Two modes, one codebase:
+The primary mode is now a *pure Elisp server* (=src/emcp-stdio.el=): Emacs
+IS the MCP server. No Python, no manifest file, no emacsclient shim. The
+obarray is the tool registry. =funcall= is the dispatch. When a running
+Emacs daemon is detected, nine additional data-layer tools provide live
+access to buffers, org files, and arbitrary eval.
 
-| Mode | Tools | Purpose |
-|------+-------+---------|
-| =core= | ~50 | Practical daily use |
-| =maximalist= | ~3600+ | Reductio ad absurdum |
+Three runtime modes, one codebase:
+
+| Mode | Command | Tools | Purpose |
+|------------------+---------------------------------------------------------+-------------------+----------------------------------|
+| =elisp-core= | =emacs --batch -Q -l src/emcp-stdio.el -f emcp-stdio-start= | ~779 + 9 daemon | Pure Elisp, no Python dependency |
+| =python-core= | =uv run python src/server.py functions-core.jsonl= | ~50 | Python shim, filtered manifest |
+| =python-max= | =uv run python src/server.py functions-compact.jsonl= | ~3600+ | Python shim, full manifest |
 
 The maximalist mode is the point: demonstrating by construction that naive
 "enumerate all tools" MCP server design saturates any agent context window.
@@ -32,27 +38,45 @@ The MCP server does not know what Emacs can do. Emacs tells it.
 #+end_quote
 
 No function list is hardcoded. All tool definitions derive from runtime
-=obarray= introspection via a live Emacs daemon. If you are hardcoding
+=obarray= introspection via a live Emacs process. If you are hardcoding
 function names anywhere except tests, you have violated the axiom.
+
+The pure Elisp server takes this to its logical conclusion: the obarray
+walk happens in the same process that serves the MCP protocol. There is
+no serialized manifest at all.
 
 * Prerequisites
 
-- Emacs 28+ with daemon support (=emacs --daemon=)
-- Python >= 3.11
-- [[https://github.com/astral-sh/uv][uv]] (package manager)
+- Emacs 28+ (required for =json-serialize=, =json-parse-string=)
+- For the Elisp server: nothing else (=emacs --batch= is sufficient)
+- For daemon data-layer tools: a running Emacs daemon (=emacs --daemon=)
+- For the Python server: Python >= 3.11, [[https://github.com/astral-sh/uv][uv]], a running Emacs daemon
 - GNU Make (=gmake= on macOS)
 
 * Quick Start
 
-#+begin_src bash
-# Clone
-ghq get jwalsh/emacs-mcp-maximalist
-# or: git clone https://github.com/jwalsh/emacs-mcp-maximalist
+** Elisp Server (recommended)
 
+#+begin_src bash
+# No setup required — Emacs is the only dependency.
+
+# Start the MCP server (core mode, vanilla Emacs)
+emacs --batch -Q -l src/emcp-stdio.el -f emcp-stdio-start
+
+# Optionally start an Emacs daemon first for data-layer tools
+emacs --daemon
+emacs --batch -Q -l src/emcp-stdio.el -f emcp-stdio-start
+# → "emacs-mcp-elisp: daemon detected — data layer tools enabled"
+# → "emacs-mcp-elisp: 788 tools (779 local + 9 daemon)"
+#+end_src
+
+** Python Server (legacy)
+
+#+begin_src bash
 # Install Python dependencies
 uv sync
 
-# Start Emacs daemon (if not already running)
+# Start Emacs daemon (required for Python mode)
 emacs --daemon
 
 # Generate manifest from running daemon
@@ -68,9 +92,61 @@ gmake test
 gmake health
 #+end_src
 
+* Elisp Server
+
+The pure Elisp server (=src/emcp-stdio.el=) reads newline-delimited
+JSON-RPC from stdin and writes responses to stdout. It speaks the MCP
+protocol directly — no Python, no manifest file, no subprocess shim.
+
+At startup it walks the obarray and builds MCP tool definitions for every
+function whose arglist matches the text-consumer heuristic (parameters
+named =string=, =text=, =buffer=, =object=, etc.). If a running Emacs
+daemon is reachable via =emacsclient=, nine additional daemon data-layer
+tools are registered.
+
+** Daemon Data-Layer Tools
+
+When a running Emacs daemon is detected, the following tools become
+available. The batch process handles MCP protocol; the daemon holds the
+data.
+
+| Tool | Description |
+|-------------------------------+--------------------------------------------------------------|
+| =emcp-data-eval= | Evaluate arbitrary Elisp in the daemon |
+| =emcp-data-buffer-list= | List all open buffers with file associations |
+| =emcp-data-buffer-read= | Read full contents of a named buffer |
+| =emcp-data-buffer-insert= | Insert text at end of a named buffer |
+| =emcp-data-find-file= | Open a file in the daemon, return buffer name |
+| =emcp-data-org-headings= | Extract org headings with level, TODO state, title, tags |
+| =emcp-data-org-set-todo= | Set the TODO state of an org heading |
+| =emcp-data-org-table= | Extract an org table as tab-separated rows |
+| =emcp-data-org-capture= | Append a new org entry under a heading |
+
+All daemon tools accept arguments via the =args= array (matching the MCP
+tool schema). The =emcp-data-eval= tool takes a single sexp string; the
+others construct the sexp from structured arguments.
+
 * Usage
 
 ** Claude Code (=.mcp.json=)
+
+The Elisp server is the recommended configuration:
+
+#+begin_src json
+{
+  "mcpServers": {
+    "emacs-mcp-elisp": {
+      "type": "stdio",
+      "command": "emacs",
+      "args": ["--batch", "-Q",
+               "-l", "/path/to/emacs-mcp-maximalist/src/emcp-stdio.el",
+               "-f", "emcp-stdio-start"]
+    }
+  }
+}
+#+end_src
+
+Python server (legacy):
 
 #+begin_src json
 {
@@ -91,6 +167,12 @@ gmake health
 #+begin_src json
 {
   "mcpServers": {
+    "emacs-mcp-elisp": {
+      "command": "emacs",
+      "args": ["--batch", "-Q",
+               "-l", "/path/to/emacs-mcp-maximalist/src/emcp-stdio.el",
+               "-f", "emcp-stdio-start"]
+    },
     "emacs-core": {
       "command": "uv",
       "args": ["run", "--directory", "/path/to/emacs-mcp-maximalist",
@@ -110,6 +192,15 @@ gmake health
 ** Emacs with mcp.el
 
 #+begin_src emacs-lisp
+;; Elisp server (recommended)
+(mcp-connect-server
+ "emacs-mcp-elisp" "emacs"
+ '("--batch" "-Q" "-l" "/path/to/emacs-mcp-maximalist/src/emcp-stdio.el"
+   "-f" "emcp-stdio-start")
+ :initial-callback (lambda (conn) (message "emacs-mcp-elisp connected"))
+ :tools-callback (lambda (conn tools) (message "%d tools" (length tools))))
+
+;; Python server (legacy)
 (mcp-connect-server
  "emacs-core" "uv"
  '("run" "--directory" "/path/to/emacs-mcp-maximalist"
@@ -121,6 +212,12 @@ gmake health
 ** MCP Inspector
 
 #+begin_src bash
+# Elisp server
+npx @anthropic-ai/mcp-inspector emacs --batch -Q \
+  -l /path/to/emacs-mcp-maximalist/src/emcp-stdio.el \
+  -f emcp-stdio-start
+
+# Python server (legacy)
 npx @anthropic-ai/mcp-inspector uv run --directory /path/to/emacs-mcp-maximalist \
   python src/server.py functions-core.jsonl
 #+end_src
@@ -128,11 +225,32 @@ npx @anthropic-ai/mcp-inspector uv run --directory /path/to/emacs-mcp-maximalist
 ** JSON-RPC (raw)
 
 #+begin_src bash
+# Elisp server
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | \
+  emacs --batch -Q -l src/emcp-stdio.el -f emcp-stdio-start
+
+# Python server (legacy)
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | \
   PYTHONPATH=src uv run python src/server.py functions-core.jsonl
 #+end_src
 
 * Architecture
+
+** Elisp Server (primary)
+
+#+begin_example
+Emacs --batch -Q (obarray)
+    ↓ emcp-stdio.el walks obarray at startup
+in-process tool cache (vector of alists)
+    ↓ tools/call
+local funcall (batch-local tools)
+  or
+emacsclient --eval (daemon data-layer tools)
+    ↓
+result → JSON-RPC → stdout
+#+end_example
+
+** Python Server (legacy)
 
 #+begin_example
 Emacs daemon (obarray)
@@ -146,29 +264,61 @@ escape.py → dispatch.py → emacsclient --eval
 result → MCP content block
 #+end_example
 
+** Component Layers
+
 | Layer | File | Role |
-|-------+-------------------+--------------------------------------|
-| L0 | =emacs --daemon= | Running Emacs (prerequisite) |
-| L1 | =src/introspect.el= | Walk obarray, emit manifest |
-| L2 | =functions-compact.jsonl= | Build artifact (JSONL, not committed) |
-| L3 | =src/escape.py= | Safe Elisp string literal builder |
-| L4 | =src/dispatch.py= | emacsclient subprocess boundary |
-| L5 | =src/server.py= | MCP server over stdio |
+|-------+-------------------+----------------------------------------------|
+| L0 | =emacs= | Running Emacs (batch or daemon) |
+| L1a | =src/emcp-stdio.el= | Pure Elisp MCP server (primary) |
+| L1b | =src/introspect.el= | Walk obarray, emit manifest (Python mode) |
+| L2 | manifest files | Build artifacts (JSONL, not committed) |
+| L3 | =src/escape.py= | Safe Elisp string literal builder (Python) |
+| L4 | =src/dispatch.py= | emacsclient subprocess boundary (Python) |
+| L5 | =src/server.py= | Python MCP server over stdio |
 | L6 | =bin/health-check.sh= | Structured health check |
 
 ** Security Boundary
 
-The escaper (=src/escape.py=) is the security surface. It handles
-backslash escaping, quote escaping, null byte rejection, and shell
-metacharacter safety. It is tested independently of the server.
+The escaper (=src/escape.py=) is the security surface for the Python
+server path. It handles backslash escaping, quote escaping, null byte
+rejection, and shell metacharacter safety. It is tested independently
+of the server.
+
+The Elisp server uses =prin1-to-string= for argument escaping and
+=format "%S"= for sexp construction — Emacs's own serialization
+handles the security boundary natively.
 
 ** Manifest Format Invariant
+
+The Python server path uses serialized manifests as build artifacts.
+These files are generated at build time and are *not committed to git*.
 
 | Format | File | Structure | Producer | Consumer |
 |--------+-------------------------+--------------------------------------+----------------------------+------------|
 | Full JSON | =emacs-functions.json= | ={"functions": [...]}= | =emcp-write-manifest= | debugging |
 | Compact JSONL | =functions-compact.jsonl= | one ={"n","s","d"}= per line | =emcp-write-manifest-compact= | server.py |
 | Core JSONL | =functions-core.jsonl= | filtered subset, same format | =emcp-write-manifest-core= | server.py |
+
+The server loads JSONL (line count = tool count). The introspector's
+full-JSON mode is for development; compact JSONL is the build artifact.
+
+The Elisp server does not use manifest files at all. It walks the
+obarray directly at startup.
+
+* Stack Preferences
+
+| Component | Choice | Rationale |
+|-------------------+----------------------------+-----------------------------------------------------|
+| MCP server | Emacs Lisp (=emcp-stdio.el=) | Emacs IS the server; no process boundary |
+| Introspection | Emacs Lisp | Only thing with live access to obarray |
+| Argument escaping | =prin1-to-string= (Elisp) | Native serialization; no custom escaper needed |
+| Protocol | JSON-RPC over stdio | MCP spec; =json-serialize= / =json-parse-string= built-in |
+| Daemon IPC | =emacsclient --eval= | Standard Emacs daemon interface |
+| Python shim | Python + =mcp= SDK | Anthropic SDK; legacy/alternative path |
+| Package manager | =uv= | Fast; lockfile reproducibility (Python path only) |
+| Tests | =pytest= | Escape and dispatch are pure; easy to unit test |
+| Build | =gmake= | Consistent with homelab conventions |
+| Spec format | =org-mode= | Canonical; tangleable; Mermaid-embeddable |
 
 * Build Pipeline
 
@@ -216,8 +366,27 @@ Five falsifiable hypotheses tracked via =cprr=:
 | C-003 | emacsclient round-trip < 50ms for string functions | open |
 | C-004 | Non-ASCII survives the full escape → emacs round trip | open |
 | C-005 | Maximalist manifest causes measurable init latency difference | open |
+| C-006 | Vanilla Emacs exposes fewer functions than configured Emacs | open |
 
 Set =EMCP_TRACE=1= to enable per-call latency and init timing instrumentation.
+
+* Anti-Goals
+
+- *Curated function subset* (c.f. emacs-mcp-curated): curation is the
+  thesis being argued against. A hand-picked list makes the artifact a
+  utility, not a demonstration.
+- *General Emacs IDE integration* (c.f. emacs-lsp, eglot, copilot.el):
+  those optimize for editor-to-language-server protocol. This project uses
+  MCP as the protocol boundary.
+- *AI assistant inside Emacs* (c.f. gptel, ellama): those embed the
+  agent in the editor. This project exposes the editor to the agent.
+  Inverted control flow.
+- *Config-dependent wrapper*: the introspector must work against a
+  vanilla =emacs -Q=. Requiring the user's init.el breaks
+  reproducibility.
+- *Python-first architecture*: the Elisp server makes this explicit.
+  Emacs Lisp owns introspection, dispatch, AND protocol. Python is a
+  legacy alternative path.
 
 * Contributing
 
