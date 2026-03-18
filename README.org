@@ -3,6 +3,12 @@
 #+author: jwalsh
 #+options: toc:2 num:nil
 
+[[https://github.com/jwalsh/emacs-mcp-maximalist/actions][https://img.shields.io/github/actions/workflow/status/jwalsh/emacs-mcp-maximalist/test.yml?branch=main&style=flat-square&logo=github&label=tests.svg]]
+[[https://github.com/jwalsh/emacs-mcp-maximalist/blob/main/LICENSE][https://img.shields.io/badge/license-Apache--2.0-blue.svg?style=flat-square.svg]]
+[[https://github.com/jwalsh/emacs-mcp-maximalist/issues][https://img.shields.io/github/issues/jwalsh/emacs-mcp-maximalist.svg?style=flat-square.svg]]
+[[https://www.python.org/downloads/][https://img.shields.io/badge/python-%E2%89%A53.11-3776AB.svg?style=flat-square&logo=python&logoColor=white.svg]]
+[[https://www.gnu.org/software/emacs/][https://img.shields.io/badge/emacs-daemon-7F5AB6.svg?style=flat-square&logo=gnuemacs&logoColor=white.svg]]
+
 * What
 
 An MCP server that exposes the full Emacs =obarray= — every text-consuming
@@ -17,6 +23,7 @@ Two modes, one codebase:
 
 The maximalist mode is the point: demonstrating by construction that naive
 "enumerate all tools" MCP server design saturates any agent context window.
+The critique only works if the thing works.
 
 * Axiom
 
@@ -25,14 +32,28 @@ The MCP server does not know what Emacs can do. Emacs tells it.
 #+end_quote
 
 No function list is hardcoded. All tool definitions derive from runtime
-=obarray= introspection via a live Emacs daemon.
+=obarray= introspection via a live Emacs daemon. If you are hardcoding
+function names anywhere except tests, you have violated the axiom.
+
+* Prerequisites
+
+- Emacs 28+ with daemon support (=emacs --daemon=)
+- Python >= 3.11
+- [[https://github.com/astral-sh/uv][uv]] (package manager)
+- GNU Make (=gmake= on macOS)
 
 * Quick Start
 
 #+begin_src bash
-# Prerequisites
-emacs --daemon
+# Clone
+ghq get jwalsh/emacs-mcp-maximalist
+# or: git clone https://github.com/jwalsh/emacs-mcp-maximalist
+
+# Install Python dependencies
 uv sync
+
+# Start Emacs daemon (if not already running)
+emacs --daemon
 
 # Generate manifest from running daemon
 gmake manifest
@@ -40,11 +61,34 @@ gmake manifest
 # Run the server (core mode)
 gmake run-core
 
-# Run tests
+# Run tests (no daemon required)
 gmake test
 
 # Check environment health
 gmake health
+#+end_src
+
+* MCP Client Configuration
+
+Add to your MCP client config (e.g. =.mcp.json= or Claude Desktop):
+
+#+begin_src json
+{
+  "mcpServers": {
+    "emacs-core": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/emacs-mcp-maximalist",
+               "python", "src/server.py", "functions-core.jsonl"],
+      "env": { "PYTHONPATH": "src" }
+    },
+    "emacs-maximalist": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/emacs-mcp-maximalist",
+               "python", "src/server.py", "functions-compact.jsonl"],
+      "env": { "PYTHONPATH": "src" }
+    }
+  }
+}
 #+end_src
 
 * Architecture
@@ -52,7 +96,7 @@ gmake health
 #+begin_example
 Emacs daemon (obarray)
     ↓ introspect.el
-functions-compact.jsonl (build artifact)
+functions-compact.jsonl (build artifact, JSONL)
     ↓ server.py loads
 MCP Server (stdio)
     ↓ tools/call
@@ -71,27 +115,74 @@ result → MCP content block
 | L5 | =src/server.py= | MCP server over stdio |
 | L6 | =bin/health-check.sh= | Structured health check |
 
+** Security Boundary
+
+The escaper (=src/escape.py=) is the security surface. It handles
+backslash escaping, quote escaping, null byte rejection, and shell
+metacharacter safety. It is tested independently of the server (23 tests).
+
+** Manifest Format Invariant
+
+| Format | File | Structure | Producer | Consumer |
+|--------+-------------------------+--------------------------------------+----------------------------+------------|
+| Full JSON | =emacs-functions.json= | ={"functions": [...]}= | =emcp-write-manifest= | debugging |
+| Compact JSONL | =functions-compact.jsonl= | one ={"n","s","d"}= per line | =emcp-write-manifest-compact= | server.py |
+| Core JSONL | =functions-core.jsonl= | filtered subset, same format | =emcp-write-manifest-core= | server.py |
+
 * Build Pipeline
 
 The project uses a sentinel-gated Makefile pipeline for bootstrapping:
 
 #+begin_src bash
-gmake status    # show pipeline + artifact status
-gmake graph     # show dependency DAG
-gmake work      # run full pipeline (bootstrap → implement)
+gmake status        # show pipeline + artifact status
+gmake graph         # show dependency DAG
+gmake work          # run full pipeline (bootstrap → implement)
 gmake -j3 parallel  # run independent phases concurrently
+gmake test          # run all tests (42 cases)
+gmake manifest      # generate both manifests from emacs daemon
+gmake run-core      # start MCP server (core mode)
+gmake run-max       # start MCP server (maximalist mode)
+gmake health        # run environment health check
+gmake sync          # export README.org → README.md
 #+end_src
+
+** Pipeline DAG
+
+#+begin_example
+spec.org
+  → bootstrap
+    → generate-claude-md
+      → review-prompt
+        ├→ wire-backlog ──────┐
+        ├→ setup-memory ──────┤  (gmake -j3 parallel)
+        └→ health-check ──────┤
+                              ↓
+                    verify-bootstrap
+                              ↓
+                          decompose
+                              ↓
+                            work
+#+end_example
 
 * Conjectures
 
 Five falsifiable hypotheses tracked via =cprr=:
 
-- *C-001*: Claude Code uses on-demand tool indexing (prior evidence: confirmed)
-- *C-002*: Arglist heuristic yields > 80% precision
-- *C-003*: emacsclient round-trip < 50ms for string functions
-- *C-004*: Non-ASCII survives the full round trip
-- *C-005*: Maximalist manifest causes measurable init latency difference
+| ID | Claim | Status |
+|-------+--------------------------------------------------------------+---------------|
+| C-001 | Claude Code uses on-demand tool indexing | prior-confirmed |
+| C-002 | Arglist heuristic yields > 80% precision | open |
+| C-003 | emacsclient round-trip < 50ms for string functions | open |
+| C-004 | Non-ASCII survives the full escape → emacs round trip | open |
+| C-005 | Maximalist manifest causes measurable init latency difference | open |
+
+Set =EMCP_TRACE=1= to enable per-call latency and init timing instrumentation.
+
+* Contributing
+
+See =CLAUDE.md= for the full project specification and coding constraints.
+See =AGENTS.md= for agent coordination protocol.
 
 * License
 
-TBD
+Apache License 2.0. See [[file:LICENSE][LICENSE]].
