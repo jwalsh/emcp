@@ -1,0 +1,7 @@
+Reference docs fetched from GNU Emacs manual:
+- batch-mode.md: stdin via minibuffer, message→stderr, princ→stdout
+- parsing-json.md: json-serialize returns UNIBYTE (critical for C-004)
+- symbol-components.md: obarray/mapatoms — the foundational introspection API
+- coding-system-basics.md: UTF-8 round-trip guarantees
+- creating-strings.md: format %S for sexp construction
+- synchronous-processes.md: call-process for emacsclient dispatch
