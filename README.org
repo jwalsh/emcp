@@ -3,11 +3,11 @@
 #+author: jwalsh
 #+options: toc:2 num:nil
 
-[[https://github.com/jwalsh/emacs-mcp-maximalist/actions][https://img.shields.io/github/actions/workflow/status/jwalsh/emacs-mcp-maximalist/test.yml?branch=main&style=flat-square&logo=github&label=tests.svg]]
-[[https://github.com/jwalsh/emacs-mcp-maximalist/blob/main/LICENSE][https://img.shields.io/badge/license-Apache--2.0-blue.svg?style=flat-square.svg]]
-[[https://github.com/jwalsh/emacs-mcp-maximalist/issues][https://img.shields.io/github/issues/jwalsh/emacs-mcp-maximalist.svg?style=flat-square.svg]]
-[[https://www.python.org/downloads/][https://img.shields.io/badge/python-%E2%89%A53.11-3776AB.svg?style=flat-square&logo=python&logoColor=white.svg]]
-[[https://www.gnu.org/software/emacs/][https://img.shields.io/badge/emacs-daemon-7F5AB6.svg?style=flat-square&logo=gnuemacs&logoColor=white.svg]]
+[[https://github.com/jwalsh/emacs-mcp-maximalist/actions][https://img.shields.io/github/actions/workflow/status/jwalsh/emacs-mcp-maximalist/test.yml.svg?branch=main&style=flat-square&logo=github&label=tests]]
+[[https://github.com/jwalsh/emacs-mcp-maximalist/blob/main/LICENSE][https://img.shields.io/badge/license-Apache--2.0-blue.svg?style=flat-square]]
+[[https://github.com/jwalsh/emacs-mcp-maximalist/issues][https://img.shields.io/github/issues/jwalsh/emacs-mcp-maximalist.svg?style=flat-square]]
+[[https://www.python.org/downloads/][https://img.shields.io/badge/python-%E2%89%A53.11-3776AB.svg?style=flat-square&logo=python&logoColor=white]]
+[[https://www.gnu.org/software/emacs/][https://img.shields.io/badge/emacs-daemon-7F5AB6.svg?style=flat-square&logo=gnuemacs&logoColor=white]]
 
 * What
 
