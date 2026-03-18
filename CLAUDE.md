@@ -73,15 +73,32 @@ Per-component implications:
 - **health-check.sh**: checks that the manifest exists and daemon is
   running. Does not read function names.
 
+## Manifest Format Invariant
+
+The introspector (L1) and the server (L5) must agree on format. Two
+formats exist; each step must name which it produces or consumes:
+
+| Format | File | Structure | Producer | Consumer |
+|--------|------|-----------|----------|----------|
+| Full JSON | `emacs-functions.json` | `{"functions": [...], "statistics": {...}}` | `emcp-write-manifest` | tests, debugging |
+| Compact JSONL | `functions-compact.jsonl` | one `{"n","s","d"}` per line | `emcp-write-manifest-compact` | server.py |
+
+The server loads JSONL (line count = tool count). The introspector's
+full-JSON mode is for development; compact JSONL is the build artifact.
+If you add a new format, update this table and both producer/consumer.
+
 ## Build Order
 
 1. **escape.py** — `pytest tests/test_escape.py` passes all cases
 2. **introspect.el** — `(emcp-write-manifest "/tmp/test.json")` returns
-   integer > 0
+   integer > 0 (full JSON mode); then
+   `(emcp-write-manifest-compact "functions-compact.jsonl")` produces
+   JSONL with `wc -l` > 0
 3. **dispatch.py** — `eval_in_emacs('(+ 1 1)')` returns `"2"`
-4. **server.py (core)** — `tools/list` returns >= 20 tools over stdio
-5. **server.py (maximalist)** — `tools/list` returns > 1000 tools;
-   Claude Code indexes lazily
+4. **server.py (core)** — loads JSONL manifest; `tools/list` returns
+   >= 20 tools over stdio
+5. **server.py (maximalist)** — loads full JSONL manifest; `tools/list`
+   returns > 1000 tools; Claude Code indexes lazily
 6. **health-check.sh** — exits 0 on a correctly configured machine
 
 If an acceptance test fails, stop. Document what failed, what you tried,
@@ -94,7 +111,7 @@ failure as a CPRR refutation candidate.
 |-------|------|---------------|
 | L0 | `emacs --daemon` | Running Emacs (prerequisite, not built) |
 | L1 | `src/introspect.el` | Walk obarray, emit manifest |
-| L2 | `functions-compact.jsonl` | Build artifact (not committed) |
+| L2 | `functions-compact.jsonl` | Build artifact — JSONL, not committed (see Manifest Format Invariant) |
 | L3 | `src/escape.py` | Safe Elisp string literal builder |
 | L4 | `src/dispatch.py` | emacsclient subprocess boundary |
 | L5 | `src/server.py` | MCP server: loads manifest, registers tools, dispatches |
