@@ -1,0 +1,6 @@
+Badge fix verification:
+- .svg was appearing in rendered badge labels (e.g., "tests.svg" instead of "tests")
+- Root cause: .svg appended after query string params instead of in URL path
+- Pattern: shields.io expects .svg as the file extension in the path segment,
+  before the ? query string. Query params like &label= are rendered as-is.
+- All 5 badges affected: tests, license, issues, python, emacs
