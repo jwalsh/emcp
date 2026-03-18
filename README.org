@@ -1,0 +1,97 @@
+#+title: emacs-mcp-maximalist
+#+subtitle: Every Text-Consuming Function in Emacs, as an MCP Tool
+#+author: jwalsh
+#+options: toc:2 num:nil
+
+* What
+
+An MCP server that exposes the full Emacs =obarray= — every text-consuming
+function — as MCP tools, introspected at runtime from a live daemon.
+
+Two modes, one codebase:
+
+| Mode | Tools | Purpose |
+|------+-------+---------|
+| =core= | ~50 | Practical daily use |
+| =maximalist= | ~3600+ | Reductio ad absurdum |
+
+The maximalist mode is the point: demonstrating by construction that naive
+"enumerate all tools" MCP server design saturates any agent context window.
+
+* Axiom
+
+#+begin_quote
+The MCP server does not know what Emacs can do. Emacs tells it.
+#+end_quote
+
+No function list is hardcoded. All tool definitions derive from runtime
+=obarray= introspection via a live Emacs daemon.
+
+* Quick Start
+
+#+begin_src bash
+# Prerequisites
+emacs --daemon
+uv sync
+
+# Generate manifest from running daemon
+gmake manifest
+
+# Run the server (core mode)
+gmake run-core
+
+# Run tests
+gmake test
+
+# Check environment health
+gmake health
+#+end_src
+
+* Architecture
+
+#+begin_example
+Emacs daemon (obarray)
+    ↓ introspect.el
+functions-compact.jsonl (build artifact)
+    ↓ server.py loads
+MCP Server (stdio)
+    ↓ tools/call
+escape.py → dispatch.py → emacsclient --eval
+    ↓
+result → MCP content block
+#+end_example
+
+| Layer | File | Role |
+|-------+-------------------+--------------------------------------|
+| L0 | =emacs --daemon= | Running Emacs (prerequisite) |
+| L1 | =src/introspect.el= | Walk obarray, emit manifest |
+| L2 | =functions-compact.jsonl= | Build artifact (JSONL, not committed) |
+| L3 | =src/escape.py= | Safe Elisp string literal builder |
+| L4 | =src/dispatch.py= | emacsclient subprocess boundary |
+| L5 | =src/server.py= | MCP server over stdio |
+| L6 | =bin/health-check.sh= | Structured health check |
+
+* Build Pipeline
+
+The project uses a sentinel-gated Makefile pipeline for bootstrapping:
+
+#+begin_src bash
+gmake status    # show pipeline + artifact status
+gmake graph     # show dependency DAG
+gmake work      # run full pipeline (bootstrap → implement)
+gmake -j3 parallel  # run independent phases concurrently
+#+end_src
+
+* Conjectures
+
+Five falsifiable hypotheses tracked via =cprr=:
+
+- *C-001*: Claude Code uses on-demand tool indexing (prior evidence: confirmed)
+- *C-002*: Arglist heuristic yields > 80% precision
+- *C-003*: emacsclient round-trip < 50ms for string functions
+- *C-004*: Non-ASCII survives the full round trip
+- *C-005*: Maximalist manifest causes measurable init latency difference
+
+* License
+
+TBD
