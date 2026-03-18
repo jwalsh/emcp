@@ -11,5 +11,11 @@ __pycache__/
 .venv/
 *.egg-info/
 
+# README.md is derived from README.org via gmake sync
+README.md
+
 # Environment
 .env
+
+# uv
+uv.lock
