@@ -148,6 +148,10 @@ implementation.
   emoji, combining characters.
 - **C-005**: The maximalist manifest (all functions) causes a measurable
   latency difference vs. core manifest at MCP session init.
+- **C-006**: A vanilla Emacs daemon (`-Q`) exposes substantially fewer
+  functions than one with user init loaded. *Falsification*: the counts
+  are identical or nearly so. *Implication*: validates that the
+  introspector should run against vanilla Emacs for reproducibility.
 
 ## Instrumentation Requirement
 
