@@ -1,6 +1,13 @@
 """dispatch.py — emacsclient subprocess boundary."""
 
+import os
 import subprocess
+import sys
+import time
+
+
+# Conjecture instrumentation: C-003 (latency), C-004 (non-ASCII round trip)
+EMCP_TRACE = os.environ.get("EMCP_TRACE", "0") == "1"
 
 
 class EmacsClientError(RuntimeError):
@@ -11,7 +18,10 @@ def eval_in_emacs(sexp: str, timeout: int = 10) -> str:
     """Evaluate SEXP via emacsclient and return result as string.
 
     Raises EmacsClientError on non-zero exit or timeout.
+
+    When EMCP_TRACE=1, logs round-trip latency to stderr (C-003).
     """
+    start_ns = time.monotonic_ns() if EMCP_TRACE else 0
     try:
         result = subprocess.run(
             ["emacsclient", "--eval", sexp],
@@ -28,4 +38,11 @@ def eval_in_emacs(sexp: str, timeout: int = 10) -> str:
         raise EmacsClientError(
             f"emacsclient exit {result.returncode}: {result.stderr.strip()}"
         )
-    return result.stdout.strip()
+
+    output = result.stdout.strip()
+    if EMCP_TRACE:
+        elapsed_ms = (time.monotonic_ns() - start_ns) / 1_000_000
+        sexp_preview = sexp[:60] + ("..." if len(sexp) > 60 else "")
+        print(f"TRACE dispatch {elapsed_ms:.1f}ms: {sexp_preview}",
+              file=sys.stderr)
+    return output
