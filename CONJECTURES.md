@@ -7,7 +7,7 @@ Detailed research in `docs/conjectures/c-NNN-research.md`.
 
 | ID | Claim | Status | Evidence |
 |----|-------|--------|----------|
-| C-001 | Claude Code uses on-demand tool indexing | Confirmed | Prior session (2026-02-04); re-verified 2026-03-17: 4324-tool server loads without crashing Claude Code. .mcp.json configured for both modes |
+| C-001 | Claude Code uses on-demand tool indexing | Confirmed (refined) | 2026-03-18: Protocol-level measurement confirms two-tier architecture. MCP layer is eager (all 780 tools in one 263KB response, no pagination). Claude Code application layer is lazy: tool names listed as `<available-deferred-tools>`, full schemas fetched on demand via `ToolSearch`. See `docs/conjectures/c-001-research.md` |
 | C-002 | Arglist heuristic yields > 80% precision | Refuted | 2026-03-18: 50-function audit yields 40% precision (20 TP, 30 FP). `object`/`buffer` arg patterns dominate false positives. See `docs/c002-audit.md` |
 | C-003 | emacsclient round-trip < 50ms for string fns | Confirmed | 2026-03-18: median=2.3ms, P95=~3ms, worst=24ms (GC jitter). 200 samples, 0% above 50ms. Prior 10.9ms was inflated by Python startup overhead |
 | C-004 | Non-ASCII survives full round trip | Confirmed | 2026-03-18: 14 character classes tested (CJK, emoji, ZWJ families, Arabic, Thai, Korean, combining, supplementary plane, flags). All byte-identical round trips via hex comparison |
@@ -16,11 +16,34 @@ Detailed research in `docs/conjectures/c-NNN-research.md`.
 
 ## Measurement Details
 
-### C-001: On-demand tool indexing (Confirmed)
+### C-001: On-demand tool indexing (Confirmed, refined 2026-03-18)
 
-Claude Code connects to the 4324-tool maximalist server without
-context window exhaustion. Tools are indexed lazily. Prior session
-(2026-02-04) first observed this; re-verified 2026-03-17 with `.mcp.json`.
+**2026-03-18 protocol-level measurement** (supersedes prior observations):
+
+The MCP protocol supports pagination (`tools/list` uses
+`PaginatedRequest`/`PaginatedResult` with `cursor`/`nextCursor`) but
+this server does not implement it. All tools are returned in one response:
+
+| Manifest | Tool count | tools/list response | Latency | Est. tokens |
+|----------|------------|---------------------|---------|-------------|
+| Core | 60 | 21 KB | 1.7ms | ~5,263 |
+| Maximalist | 780 | 263 KB | 8.2ms | ~67,264 |
+| Synthetic | 3,600 | 1.2 MB | 60.1ms | ~315,356 |
+
+All responses had `nextCursor=None`. The MCP client receives the
+full tool list eagerly.
+
+**Two-tier indexing confirmed via self-observation**: Claude Code (Opus
+4.6) operates with 840 MCP tools (60 core + 780 maximalist) in this
+session. Tools appear as `<available-deferred-tools>` (names only) in
+the system prompt. Full JSON schemas are fetched on demand via
+`ToolSearch`. The LLM context never contains all 263 KB of tool schemas.
+
+Architecture: MCP layer = eager (full dump), application layer = lazy
+(names in prompt, schemas on demand).
+
+Prior evidence: original session (2026-02-04, ~3169 tools), re-verified
+2026-03-17 (4324 tools).
 
 ### C-003: emacsclient latency (Confirmed)
 
