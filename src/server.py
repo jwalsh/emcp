@@ -7,7 +7,9 @@ maximalist (full manifest).
 
 import asyncio
 import json
+import os
 import sys
+import time
 from pathlib import Path
 
 from mcp.server import Server
@@ -71,10 +73,27 @@ def create_server(manifest_path: Path) -> tuple[Server, int]:
     """Create and configure an MCP server from a JSONL manifest.
 
     Returns (server, tool_count).
+
+    When EMCP_TRACE=1, logs init latency breakdown to stderr (C-005).
     """
+    trace_enabled = os.environ.get("EMCP_TRACE", "0") == "1"
+    init_start = time.monotonic_ns() if trace_enabled else 0
+
     functions = load_manifest_jsonl(manifest_path)
+    parse_done = time.monotonic_ns() if trace_enabled else 0
+
     tools = build_tools(functions)
+    build_done = time.monotonic_ns() if trace_enabled else 0
+
     tool_count = len(tools)
+
+    if trace_enabled:
+        parse_ms = (parse_done - init_start) / 1_000_000
+        build_ms = (build_done - parse_done) / 1_000_000
+        total_ms = parse_ms + build_ms
+        print(f"TRACE init: parse={parse_ms:.1f}ms build={build_ms:.1f}ms "
+              f"total={total_ms:.1f}ms tools={tool_count}",
+              file=sys.stderr)
 
     app = Server("emacs-mcp-maximalist")
 
