@@ -1,0 +1,474 @@
+% Created 2026-03-19 Thu 04:41
+% Intended LaTeX compiler: pdflatex
+\documentclass[presentation]{beamer}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{graphicx}
+\usepackage{longtable}
+\usepackage{wrapfig}
+\usepackage{rotating}
+\usepackage[normalem]{ulem}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{capt-of}
+\usepackage{hyperref}
+\usetheme{default}
+\author{jwalsh}
+\date{2026-03-18}
+\title{Emacs All The Way Down}
+\subtitle{From Python Shim to Pure Elisp MCP Server in One Session}
+\hypersetup{
+ pdfauthor={jwalsh},
+ pdftitle={Emacs All The Way Down},
+ pdfkeywords={},
+ pdfsubject={},
+ pdfcreator={Emacs 30.2 (Org mode 9.7.11)}, 
+ pdflang={English}}
+\begin{document}
+
+\maketitle
+\begin{frame}[label={sec:org6bdf072},fragile]{Emacs All The Way Down: An Experience Report}
+ An MCP server that exposes the full Emacs \texttt{obarray} as tools.
+
+\begin{itemize}
+\item Started: Python shim wrapping \texttt{emacsclient}
+\item Ended: Pure Elisp MCP server --- \textasciitilde{}280 lines, no external deps
+\item Duration: One session (2026-03-17 to 2026-03-18)
+\item 27+ agents, 36 commits, 11 conjectures
+\end{itemize}
+\end{frame}
+\begin{frame}[label={sec:org8bc7a73},fragile]{The Axiom}
+ \begin{quote}
+The MCP server does not know what Emacs can do. Emacs tells it.
+\end{quote}
+\begin{block}{All tool definitions derived at runtime from \texttt{obarray} introspection}
+\end{block}
+\begin{block}{No function list is hardcoded}
+\end{block}
+\begin{block}{If you are hardcoding function names, you have violated the axiom}
+\end{block}
+\end{frame}
+\begin{frame}[label={sec:org4ec31fc},fragile]{Starting Point: The Python Shim}
+ Five layers between the MCP client and Emacs:
+
+\begin{center}
+\begin{tabular}{lll}
+Layer & File & Role\\
+\hline
+L1 & introspect.el & Walk obarray, emit JSONL manifest\\
+L2 & functions-compact.jsonl & Build artifact (not committed)\\
+L3 & escape.py & Safe Elisp string literal builder\\
+L4 & dispatch.py & emacsclient subprocess boundary\\
+L5 & server.py & MCP server: load manifest, register\\
+\end{tabular}
+\end{center}
+\begin{block}{\texttt{escape.py} was the security surface --- 11 edge cases, independently tested}
+\end{block}
+\begin{block}{\texttt{emacsclient -{}-{}eval} as IPC --- no custom protocols}
+\end{block}
+\begin{block}{Two runtime modes: core (\textasciitilde{}50 tools) and maximalist (\textasciitilde{}3600+ tools)}
+\end{block}
+\end{frame}
+\begin{frame}[label={sec:org7f89871},fragile]{The Pivot}
+ "What if Emacs IS the server?"
+\begin{block}{Unicode round-trip test (C-004) sparked the idea}
+\end{block}
+\begin{block}{14 character classes: CJK, emoji, ZWJ families, Arabic, combining chars}
+\end{block}
+\begin{block}{All byte-identical through \texttt{prin1-to-string} / \texttt{funcall} / stdout}
+\end{block}
+\begin{block}{If Emacs can serialize, dispatch, and respond --- why have Python at all?}
+\end{block}
+\end{frame}
+\begin{frame}[label={sec:orga0d5e9d},fragile]{emcp-stdio.el}
+ \textasciitilde{}280 lines of Emacs Lisp. One file. No dependencies.
+\begin{block}{Reads JSON-RPC from stdin via \texttt{json-parse-string}}
+\end{block}
+\begin{block}{Walks \texttt{obarray} at startup --- builds tool defs for text-consumer functions}
+\end{block}
+\begin{block}{\texttt{funcall} dispatches directly --- no subprocess, no manifest}
+\end{block}
+\begin{block}{\texttt{send-string-to-terminal} writes responses to stdout (unbuffered)}
+\end{block}
+\begin{block}{Detects running daemon --- adds 9 data-layer tools via \texttt{emacsclient}}
+\begin{verbatim}
+emacs --batch -Q -l src/emcp-stdio.el -f emcp-stdio-start
+\end{verbatim}
+
+Source: \href{../../../src/emcp-stdio.el}{src/emcp-stdio.el}
+\end{block}
+\end{frame}
+\begin{frame}[label={sec:org2d7b190},fragile]{The Deletion}
+ Python stack removed: -2381 lines bash, +1309 lines Elisp.
+\begin{block}{Deleted: \texttt{server.py}, \texttt{escape.py}, \texttt{dispatch.py}, \texttt{introspect.el} (manifest mode)}
+\end{block}
+\begin{block}{Deleted: \texttt{uv} lockfile, \texttt{mcp} Python SDK dependency, \texttt{functions-compact.jsonl}}
+\end{block}
+\begin{block}{Deleted: 27 files with Python/legacy references purged}
+\end{block}
+\begin{block}{The manifest format invariant became unnecessary --- there is no manifest}
+\end{block}
+\begin{block}{The obarray IS the manifest. \texttt{funcall} IS the dispatch.}
+\begin{verbatim}
+Before: MCP Client -> server.py -> dispatch.py -> emacsclient -> Emacs
+After:  MCP Client -> emcp-stdio.el (Emacs IS the server)
+\end{verbatim}
+\end{block}
+\end{frame}
+\begin{frame}[label={sec:org1e1587e},fragile]{C-011: Stdout Buffering --- The Real Bug}
+ \texttt{princ} + \texttt{terpri} in Emacs batch mode does not flush stdout to a pipe.
+\begin{block}{4 agents investigated, 6 approaches tested}
+\begin{center}
+\begin{tabular}{lll}
+Approach & Works? & Notes\\
+\hline
+\texttt{princ} + \texttt{terpri} & NO & libc stdio fully buffered on pipes\\
+\texttt{princ} + \texttt{sit-for 0} & NO & sit-for does not trigger fflush\\
+\texttt{send-string-to-terminal} & YES & Direct fd 1 write, cross-platform\\
+\texttt{write-region /dev/stdout} & YES & Bypasses libc via write(2), Unix only\\
+\texttt{write-region /dev/fd/1} & YES & Same mechanism, macOS/Linux\\
+\texttt{call-process-region} + \texttt{cat} & NO & Output goes to standard-output var\\
+\end{tabular}
+\end{center}
+\end{block}
+\begin{block}{\texttt{send-string-to-terminal} chosen --- writes directly to fd 1}
+\end{block}
+\begin{block}{Secondary fix: daemon check hanging on unreachable remote sockets}
+Details: \href{../../conjectures/c-011-stdout-buffering.md}{docs/conjectures/c-011-stdout-buffering.md}
+\end{block}
+\end{frame}
+\begin{frame}[label={sec:org86767bd},fragile]{Daemon Data Layer}
+ 9 tools that bridge batch-mode MCP server to live daemon state.
+
+\begin{center}
+\begin{tabular}{ll}
+Tool & Description\\
+\hline
+\texttt{emcp-data-eval} & Evaluate arbitrary Elisp in the daemon\\
+\texttt{emcp-data-buffer-list} & List all open buffers with file associations\\
+\texttt{emcp-data-buffer-read} & Read full contents of a named buffer\\
+\texttt{emcp-data-buffer-insert} & Insert text at end of a named buffer\\
+\texttt{emcp-data-find-file} & Open a file in the daemon\\
+\texttt{emcp-data-org-headings} & Extract org headings (level, TODO, title, tags)\\
+\texttt{emcp-data-org-set-todo} & Set the TODO state of an org heading\\
+\texttt{emcp-data-org-table} & Extract an org table as TSV rows\\
+\texttt{emcp-data-org-capture} & Append a new org entry under a heading\\
+\end{tabular}
+\end{center}
+\begin{block}{Batch process handles MCP protocol; daemon holds the data}
+\end{block}
+\begin{block}{Emacs as database: buffers, org files, arbitrary eval}
+\end{block}
+\end{frame}
+\begin{frame}[label={sec:org8c7a392},fragile]{Testing at Scale}
+ 191 ert tests. Tier 1 smoke: 795 tools, 0 crashes.
+\begin{block}{33 categories by symbol naming convention}
+\end{block}
+\begin{block}{Top categories: other (307), predicate (50), completion (49), seq (47), string (42)}
+\end{block}
+\begin{block}{Safety classes: safe, gui, mutation, danger}
+\end{block}
+\begin{block}{Dangerous tools (\texttt{shell-command}, \texttt{call-process}, etc.) skipped by skip list}
+\begin{center}
+\begin{tabular}{rll}
+Tier & Scope & Status\\
+\hline
+1 & Smoke: all 779 tools, 0 args & DONE\\
+2 & Category: \textasciitilde{}5 tests each & PLANNED\\
+3 & Property-based invariants & PLANNED\\
+4 & Fuzz: random inputs & PLANNED\\
+\end{tabular}
+\end{center}
+
+Details: \href{../../test-strategy-800-tools.org}{docs/test-strategy-800-tools.org}
+\end{block}
+\end{frame}
+\begin{frame}[label={sec:org8dbf71a}]{Agent Coordination}
+27+ agents this session. Monitor caught daemon churn.
+\begin{block}{System monitor: 3 snapshots, 3 different daemon PIDs in 2 minutes}
+\end{block}
+\begin{block}{Daemon uptime: 16s, 14s, 1s --- decreasing, consistent with agent churn}
+\end{block}
+\begin{block}{Original fg-daemon (33+ days uptime, PID 2949) died during observation}
+\end{block}
+\begin{block}{ERT tests: 62/62 pass consistently --- batch mode unaffected by daemon instability}
+\begin{center}
+\begin{tabular}{lrrr}
+Metric & Snap 1 & Snap 2 & Snap 3\\
+\hline
+Daemon PID & 4376 & 5220 & 6694\\
+Daemon uptime (s) & 16 & 14 & 1\\
+Buffer count & 11 & 7 & 5\\
+ERT tests & 62/62 & 62/62 & 62/62\\
+\end{tabular}
+\end{center}
+\end{block}
+\begin{block}{Recommendation: shared long-lived daemon, lock file, 10s+ timeout}
+Details: \href{../../data-layer/system-monitor.md}{docs/data-layer/system-monitor.md}
+\end{block}
+\end{frame}
+\begin{frame}[label={sec:org81e3b7c},fragile]{Conjectures: CPRR Lifecycle}
+ 11 conjectures. 8 confirmed, 1 refuted, 2 active.
+
+\begin{center}
+\begin{tabular}{lll}
+ID & Claim & Status\\
+\hline
+C-001 & Claude Code uses on-demand tool indexing & Confirmed (refined)\\
+C-002 & Arglist heuristic > 80\% precision & Refuted (40\%)\\
+C-003 & emacsclient round-trip < 50ms & Confirmed (2.3ms)\\
+C-004 & Non-ASCII survives full round trip & Confirmed (14 classes)\\
+C-005 & Maximalist tool count causes init latency & Confirmed\\
+C-006 & Vanilla exposes fewer fns than configured & Confirmed (18.7\%)\\
+C-008 & Pure Elisp replaces Python shim & Confirmed\\
+C-009 & Autoload barrier hides 222 functions & Active\\
+C-010 & Emacs 27.1+ version compatibility & Confirmed\\
+C-011 & Batch mode stdout buffering blocks MCP & Confirmed and fixed\\
+\end{tabular}
+\end{center}
+
+\begin{verbatim}
+stateDiagram-v2
+    [*] --> Open: register
+    Open --> Confirmed: measurement confirms
+    Open --> Refuted: measurement contradicts
+    Open --> Indeterminate: inconclusive data
+    Confirmed --> [*]
+    Refuted --> [*]
+    Indeterminate --> Open: new measurement
+\end{verbatim}
+\end{frame}
+\begin{frame}[label={sec:org4418020},fragile]{C-006 Deep Dive}
+ Vanilla (-Q) = 8460 functions. Configured = 10040. Delta = 1580 (18.7\%).
+\begin{block}{5 hypotheses, all confirmed}
+\begin{center}
+\begin{tabular}{ll}
+Finding & Detail\\
+\hline
+\texttt{-{}-{}batch} implies \texttt{-q} & No user init loaded in batch mode\\
+Filter masks 93\% of delta & Heuristic reduces 1580 to \textasciitilde{}110 extra\\
+222 hidden autoloads & \texttt{help-function-arglist} returns sentinel\\
+C primitives identical (1336) & init.el adds only Elisp-defined fns\\
+Category error in test & Vanilla vs configured test was comparing wrong scope\\
+\end{tabular}
+\end{center}
+\end{block}
+\begin{block}{The text-consumer heuristic acts as a natural stabilizer}
+\end{block}
+\begin{block}{Core tool set is stable regardless of user configuration}
+\end{block}
+\begin{block}{780 tools = \textasciitilde{}9.2\% of vanilla functions, \textasciitilde{}7.8\% of configured}
+\end{block}
+\end{frame}
+\begin{frame}[label={sec:org60ae4ce},fragile]{C-009: The Autoload Barrier}
+ 222 text-consumer functions hidden by unavailable arglists.
+\begin{block}{Problem: \texttt{help-function-arglist} returns sentinel for unloaded autoloads}
+\end{block}
+\begin{block}{Resolving would yield 28.8\% increase in tool count}
+5 approaches under investigation:
+
+\begin{center}
+\begin{tabular}{lll}
+Approach & Mechanism & Risk\\
+\hline
+A: Selective autoload-do-load & Force-load matching symbols & Side effects on load\\
+B: Parse autoload objects & Extract arglist from plist & Rarely present\\
+C: Parse .elc headers & Read bytecode without eval & Fragile, circular dep\\
+D: Bulk-load loaddefs.el & Replay normal startup & Violates -Q constraint\\
+E: Static arglist map & Grep .el source at build time & Stale if Emacs updates\\
+\end{tabular}
+\end{center}
+
+Details: \href{../../conjectures/c-009-autoload-barrier.md}{docs/conjectures/c-009-autoload-barrier.md}
+\end{block}
+\end{frame}
+\begin{frame}[label={sec:org11fc12c},fragile]{What We Proved}
+ \begin{block}{Emacs can serve MCP natively --- no Python, no Node, no subprocess shim}
+\end{block}
+\begin{block}{The \texttt{obarray} IS the tool registry --- no manifest file needed}
+\end{block}
+\begin{block}{\texttt{funcall} IS the dispatch --- no s-expression builder needed}
+\end{block}
+\begin{block}{\texttt{prin1-to-string} IS the security boundary --- no custom escaper needed}
+\end{block}
+\begin{block}{\textasciitilde{}280 lines of Elisp replaces \textasciitilde{}2381 lines of Python/bash}
+\end{block}
+\begin{block}{The reductio works: 779 tools exposed, agent context not saturated (C-001)}
+\end{block}
+\begin{block}{CPRR (Conjecture-Prediction-Refutation-Refinement) drives implementation}
+\end{block}
+\end{frame}
+\begin{frame}[label={sec:orgbe1f949},fragile]{What We Discovered}
+ \begin{block}{Batch mode stdout buffering (C-011)}
+\begin{block}{\texttt{princ} does not flush to pipes --- protocol-breaking for interactive MCP}
+\end{block}
+\begin{block}{\texttt{send-string-to-terminal} is the cross-platform fix}
+\end{block}
+\end{block}
+\begin{block}{Daemon instability under concurrent agents}
+\begin{block}{3 daemon PIDs in 2 minutes with 9 agents}
+\end{block}
+\begin{block}{No coordination protocol for daemon lifecycle}
+\end{block}
+\end{block}
+\begin{block}{Text property leaks}
+\begin{block}{\texttt{json-serialize} returns unibyte strings in batch mode}
+\end{block}
+\begin{block}{Requires \texttt{decode-coding-string} before output}
+\end{block}
+\end{block}
+\begin{block}{Arglist heuristic is imprecise (C-002)}
+\begin{block}{40\% precision vs. 80\% conjectured}
+\end{block}
+\begin{block}{\texttt{object=/=buffer} args dominate false positives}
+\end{block}
+\end{block}
+\end{frame}
+\begin{frame}[label={sec:org36a0586}]{By the Numbers}
+\begin{center}
+\begin{tabular}{lr}
+Metric & Value\\
+\hline
+Commits (session) & 36\\
+Agents (concurrent peak) & 27+\\
+ERT tests & 191\\
+Tools (vanilla, -Q) & 779\\
+Tools (with daemon) & 788\\
+Conjectures & 11\\
+Conjectures confirmed & 8\\
+Conjectures refuted & 1\\
+Conjectures active & 2\\
+Elisp server (lines) & \textasciitilde{}280\\
+Python deleted (lines) & \textasciitilde{}2381\\
+Daemon data-layer tools & 9\\
+Tool categories & 33\\
+Smoke test crashes & 0\\
+Unicode char classes tested & 14\\
+emacsclient median latency & 2.3ms\\
+\end{tabular}
+\end{center}
+\end{frame}
+\begin{frame}[label={sec:orge44f5b2},fragile]{Architecture}
+ \begin{verbatim}
+sequenceDiagram
+    participant Client as MCP Client
+    participant Server as emcp-stdio.el (batch)
+    participant Daemon as Emacs Daemon
+
+    Client->>Server: initialize
+    Server-->>Client: capabilities (JSON-RPC)
+
+    Client->>Server: tools/list
+    Note right of Server: mapatoms + text-consumer filter
+    Server-->>Client: 779 tools
+
+    Client->>Server: tools/call (string-trim, " hello ")
+    Note right of Server: funcall in-process
+    Server-->>Client: "hello"
+
+    Client->>Server: tools/call (emcp-data-eval, "(+ 1 1)")
+    Server->>Daemon: emacsclient --eval "(+ 1 1)"
+    Daemon-->>Server: "2"
+    Server-->>Client: "2"
+
+    Client->>Server: tools/call (emcp-data-org-headings, "todo.org")
+    Server->>Daemon: emacsclient --eval (org-element-map ...)
+    Daemon-->>Server: headings as alist
+    Server-->>Client: formatted headings
+\end{verbatim}
+\end{frame}
+\begin{frame}[label={sec:orgaa6c89a},fragile]{Project Arc}
+ \begin{verbatim}
+gantt
+    title From Spec to Pure Elisp --- Two Sessions
+    dateFormat YYYY-MM-DD
+    axisFormat %m-%d
+
+    section Phase 1: Python Shim (2026-03-17)
+    spec.org + CLAUDE.md           :done, p1, 2026-03-17, 3h
+    escape.py + introspect.el      :done, p2, after p1, 3h
+    server.py (MCP over stdio)     :done, p3, after p2, 2h
+    health-check.sh + CI           :done, p4, after p3, 1h
+    Conjectures C-001 thru C-006   :done, p5, after p3, 2h
+
+    section Phase 2: Measurement (2026-03-18 AM)
+    C-001 two-tier confirmed       :done, m1, 2026-03-18, 2h
+    C-002 refuted at 40%           :done, m2, after m1, 1h
+    C-003 latency 2.3ms           :done, m3, after m1, 1h
+    C-004 14 char classes          :done, m4, after m1, 1h
+    C-005 init latency confirmed   :done, m5, after m1, 1h
+    C-006 vanilla vs configured    :done, m6, after m1, 1h
+
+    section Phase 3: Paradigm Shift (PM)
+    Unicode round-trip via MCP     :done, s1, after m6, 1h
+    Emacs all the way down         :milestone, s2, after s1, 0d
+    emcp-stdio.el                  :done, s3, after s2, 2h
+    Daemon data layer (9 tools)    :done, s4, after s3, 1h
+    C-008 confirmed                :done, s6, after s4, 30min
+
+    section Phase 4: Python Elimination
+    Delete entire Python stack     :crit, done, d1, after s6, 30min
+    Purge all references           :done, d2, after d1, 1h
+
+    section Phase 5: Hardening (19 agents)
+    5 contract specs               :done, h1, after d2, 2h
+    ert test suite (191 tests)     :done, h2, after d2, 2h
+    CI workflows                   :done, h3, after d2, 1h
+    C-011 stdout buffering fixed   :done, h6, after h2, 30min
+
+    section Phase 6: Investigation
+    C-006 deep dive (5 hypotheses) :done, i1, after h6, 2h
+    C-009 autoload barrier         :active, i6, after i1, 1d
+    C-010 version compat           :done, i7, after i1, 1h
+\end{verbatim}
+\end{frame}
+\begin{frame}[label={sec:orgf837567},fragile]{Open Questions}
+ \begin{block}{C-009: Autoload barrier}
+\begin{block}{222 functions hidden --- 5 approaches, none clearly safe}
+\end{block}
+\begin{block}{Selective loading risks side effects; static parsing is fragile}
+\end{block}
+\end{block}
+\begin{block}{Daemon coordination}
+\begin{block}{Multiple agents spawn competing daemons}
+\end{block}
+\begin{block}{Need lock file or shared daemon protocol}
+\end{block}
+\begin{block}{The \texttt{aq} gossip layer is a potential solution}
+\end{block}
+\end{block}
+\begin{block}{\texttt{org-element-parse-buffer} as structured data}
+\begin{block}{Org files are semi-structured --- parse tree gives agents typed access}
+\end{block}
+\begin{block}{Currently returning flat text from daemon tools}
+\end{block}
+\end{block}
+\begin{block}{Arglist heuristic refinement}
+\begin{block}{40\% precision is not good enough (C-002 refuted)}
+\end{block}
+\begin{block}{Tighter patterns? Exclude \texttt{object=/=buffer} from predicates?}
+\end{block}
+\begin{block}{Or: accept the false positives --- the reductio benefits from more tools}
+\end{block}
+\end{block}
+\end{frame}
+\begin{frame}[label={sec:org1517a9e}]{Links}
+\begin{center}
+\begin{tabular}{ll}
+Resource & Location\\
+\hline
+Repository & \href{https://github.com/jwalsh/emacs-mcp-maximalist}{github.com/jwalsh/emacs-mcp-maximalist}\\
+Server source & \href{../../../src/emcp-stdio.el}{src/emcp-stdio.el}\\
+Project spec & \href{../../../CLAUDE.md}{CLAUDE.md}\\
+Conjectures & \href{../../../CONJECTURES.md}{CONJECTURES.md}\\
+Canonical spec & \href{../../../spec.org}{spec.org}\\
+Test strategy & \href{../../test-strategy-800-tools.org}{docs/test-strategy-800-tools.org}\\
+C-011 research & \href{../../conjectures/c-011-stdout-buffering.md}{docs/conjectures/c-011-stdout-buffering.md}\\
+C-009 research & \href{../../conjectures/c-009-autoload-barrier.md}{docs/conjectures/c-009-autoload-barrier.md}\\
+System monitor & \href{../../data-layer/system-monitor.md}{docs/data-layer/system-monitor.md}\\
+Original session (2026-02-04) & \href{https://claude.ai/chat/9b7cf6a1-cd64-4eae-bb33-28e370783c20}{claude.ai/chat/9b7cf6a1}\\
+Original gist & \href{https://gist.github.com/aygp-dr/cc7f50fece2107f8c5b566d1f9cf38ad}{gist:cc7f50fe}\\
+\end{tabular}
+\end{center}
+\end{frame}
+\end{document}
