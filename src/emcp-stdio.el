@@ -432,13 +432,17 @@ to avoid embedded escaped quotes that confuse the Elisp reader."
 
 (defun emcp-stdio--daemon-recover ()
   "Attempt to reconnect to daemon after a call failure.
-Returns non-nil if recovery succeeded."
+Does NOT auto-restart — chaos testing showed auto-restart causes
+cascade failures under concurrent agent load.  Recovery only
+retries the check; daemon lifecycle is managed externally
+\(make daemon-start, bin/emcp-daemon.sh)."
   (message "%s: daemon call failed, attempting recovery..." emcp-stdio--server-name)
   (let ((recovered (emcp-stdio--check-daemon)))
     (setq emcp-stdio--daemon-available recovered)
     (if recovered
         (message "%s: daemon recovered" emcp-stdio--server-name)
-      (message "%s: daemon unreachable — data layer tools disabled" emcp-stdio--server-name))
+      (message "%s: daemon unreachable — data layer tools disabled"
+               emcp-stdio--server-name))
     recovered))
 
 ;;; ---- Main ----
