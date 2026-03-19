@@ -1,0 +1,451 @@
+#+TITLE: Test Strategy: 800 Tools Systematic Coverage
+#+AUTHOR: emacs-mcp-maximalist
+#+DATE: 2026-03-18
+#+PROPERTY: header-args :eval no
+
+* Overview
+
+The emacs-mcp-maximalist server exposes ~779 tools from Emacs's =obarray=
+via the text-consumer heuristic (=emcp-stdio--text-consumer-p=).  Testing
+all of them individually is impractical in a single test run.  This
+document defines a tiered strategy that achieves full coverage through
+progressive narrowing: every tool gets a smoke test, representative tools
+get semantic tests, and invariant properties are verified across classes.
+
+** How tools are discovered
+
+=emcp-stdio--collect-tools= walks =obarray= and keeps any =fboundp= symbol
+whose arglist matches the regex:
+
+#+begin_example
+string\|text\|str[^iua]\|buffer\|sequence\|object
+#+end_example
+
+Each tool is exposed with a uniform schema: a single =args= parameter
+(array of strings).  The dispatch in =emcp-stdio--handle-tools-call=
+builds an s-expression =(TOOL-NAME "arg1" "arg2" ...)=, reads it, and
+evals it.  Errors are caught by =condition-case= and returned as
+=isError= content, never as JSON-RPC protocol errors.
+
+** How tools are called (dispatch path)
+
+1. Client sends =tools/call= with =name= and =arguments.args= (vector of strings)
+2. Server converts args vector to list
+3. Builds sexp: =(format "(%s %s)" name (mapconcat ... args))=
+4. =eval (read sexp-str)= executes it
+5. Result formatted as string via =(format "%s" result)=
+6. Errors caught, returned as content with =isError= flag
+
+* Tool Categorization
+
+Measured on =emacs --batch -Q= (vanilla Emacs, 2026-03-18):
+
+| Category       | Count | Prefix/Pattern              | Safety   |
+|----------------+-------+-----------------------------+----------|
+| other          |   307 | (mixed)                     | mixed    |
+| predicate      |    50 | =-p$=                       | safe     |
+| completion     |    49 | =completion-=               | safe     |
+| seq            |    47 | =seq-=                      | safe     |
+| string         |    42 | =string-=                   | safe     |
+| display-buffer |    29 | =display-buffer=            | gui      |
+| help           |    22 | =help-=                     | safe     |
+| buffer         |    20 | =buffer-=                   | mixed    |
+| json           |    16 | =json-=                     | safe     |
+| set            |    14 | =set-=                      | mutation |
+| byte-compile   |    14 | =byte-=                     | safe     |
+| isearch        |    13 | =isearch=                   | gui      |
+| lgstring       |    13 | =lgstring=                  | safe     |
+| get            |    12 | =get-=                      | safe     |
+| cl             |    11 | =cl-=                       | safe     |
+| describe       |    11 | =describe=                  | gui      |
+| navigation     |    11 | =next-= / =previous-=      | safe     |
+| font           |    10 | =font=                      | gui      |
+| replace        |    10 | =replace-=                  | mutation |
+| compose        |     9 | =compose=                   | safe     |
+| window         |     9 | =window=                    | gui      |
+| make           |     8 | =make-=                     | safe     |
+| format         |     7 | =format=                    | safe     |
+| define         |     7 | =define=                    | mutation |
+| insert         |     7 | =insert=                    | mutation |
+| switch         |     7 | =switch-to-= / =pop-to-=   | gui      |
+| search         |     5 | =search-=                   | safe     |
+| process        |     5 | =process=                   | danger   |
+| kill           |     5 | =kill-=                     | mutation |
+| match          |     4 | =match-=                    | safe     |
+| display        |     2 | =display-= (non-buffer)     | gui      |
+| url            |     2 | =url-=                      | safe     |
+| eieio          |     1 | =eieio=                     | safe     |
+|----------------+-------+-----------------------------+----------|
+| *Total*        |   779 |                             |          |
+
+** Safety classifications
+
+- *safe*: Pure or side-effect-free in batch mode.  Can call with any input.
+- *gui*: Requires a display or window system.  Will error in =--batch -Q= but should not crash.
+- *mutation*: Modifies buffers, variables, or state.  Safe to call in batch (temp buffers) but needs cleanup.
+- *danger*: Shell execution, process spawning.  Must be sandboxed or skipped in smoke tests.
+
+* Test Tiers
+
+** Tier 1: Smoke Tests (all 779 tools)
+:PROPERTIES:
+:ESTIMATED_TIME: ~3 minutes (779 tools x ~200ms each)
+:FILE: tests/test-tier1-smoke.el
+:END:
+
+*** Goal
+
+For every tool: call it with zero args and verify that the server
+produces a valid JSON-RPC response (either success or graceful error).
+No tool call should cause:
+- An unhandled Elisp error (crash)
+- A hang (infinite loop)
+- Corruption of the server state (subsequent calls fail)
+
+*** Design
+
+#+begin_src elisp
+;; Pseudo-code for Tier 1
+(seq-doseq (tool tools)
+  (condition-case err
+      (emcp-stdio--handle-tools-call id `((name . ,name) (arguments . ((args . [])))))
+    (error (record-crash name err))))
+#+end_src
+
+The test iterates over =emcp-stdio--tools-cache= and calls each tool
+with an empty args array.  Most tools will return an error (wrong
+number of arguments), which is the expected behavior -- the server
+wraps all errors in =condition-case= and returns them as content.
+
+A *crash* is defined as an error that escapes the =condition-case= in
+=emcp-stdio--handle-tools-call=.  This should never happen.
+
+*** What it catches
+
+- Functions that segfault or hang when called with no args
+- Missing =condition-case= coverage in the dispatch
+- Functions that have been removed from the obarray since last test run
+- Broken =json-serialize= on certain return values
+
+*** Batch execution
+
+Run in a single =emacs --batch -Q= process.  All 779 tools share one
+process; this tests that no tool corrupts global state for subsequent
+tools.
+
+#+begin_src shell
+emacs --batch -Q \
+  -l src/emcp-stdio.el \
+  -l tests/test-tier1-smoke.el \
+  -f ert-run-tests-batch-and-exit
+#+end_src
+
+** Tier 2: Category Tests (~33 categories, ~5 tests each)
+:PROPERTIES:
+:ESTIMATED_TIME: ~2 minutes
+:FILE: tests/test-tier2-categories.el (future)
+:END:
+
+*** Goal
+
+For each category, test 3-5 representative functions with known
+input/output pairs.  This validates that the dispatch pipeline
+correctly passes arguments and returns results for each function
+family.
+
+*** Planned test cases by category
+
+**** string (42 tools)
+
+| Function            | Input              | Expected Output  |
+|---------------------+--------------------+------------------|
+| string-trim         | " hello "          | "hello"          |
+| string-reverse      | "abc"              | "cba"            |
+| string-join         | ["a" "b" "c"], "-" | "a-b-c"          |
+| string-prefix-p     | "he", "hello"      | t                |
+| string-to-number    | "42"               | 42               |
+
+**** buffer (20 tools)
+
+| Function          | Input            | Expected              |
+|-------------------+------------------+-----------------------|
+| buffer-name       | (no args)        | current buffer name   |
+| buffer-size       | (no args)        | integer >= 0          |
+| buffer-live-p     | (buffer object)  | t or nil              |
+
+**** seq (47 tools)
+
+| Function          | Input              | Expected         |
+|-------------------+--------------------+------------------|
+| seq-length        | '(1 2 3)           | 3                |
+| seq-elt           | '(a b c), 1        | b                |
+| seq-reverse       | '(1 2 3)           | (3 2 1)          |
+| seq-contains-p    | '(1 2 3), 2        | t                |
+| seq-filter        | #'cl-oddp, '(1..4) | (1 3)            |
+
+Note: seq functions take sequences, not strings.  The dispatch passes
+all args as strings, so these will be =read= as string literals.  The
+test must verify that the error is graceful (wrong type argument)
+rather than a crash.
+
+**** json (16 tools)
+
+| Function             | Input             | Expected            |
+|----------------------+-------------------+---------------------|
+| json-encode          | '((a . 1))        | ={"a":1}=           |
+| json-parse-string    | ={"a":1}=         | alist or hash-table |
+| json-encode-string   | "hello"           | ="hello"=           |
+
+**** predicate (50 tools)
+
+All predicates should return =t= or =nil= for any input.  Test with
+string arg (since dispatch passes strings):
+
+| Function    | Input     | Expected |
+|-------------+-----------+----------|
+| stringp     | "hello"   | t        |
+| integerp    | "hello"   | nil      |
+| listp       | "hello"   | nil      |
+| numberp     | "42"      | nil      |
+| null        | "hello"   | nil      |
+
+**** format (7 tools)
+
+| Function           | Input           | Expected          |
+|--------------------+-----------------+-------------------|
+| format             | "%s!", "hello"  | "hello!"          |
+| format-message     | "%s!", "hello"  | "hello!"          |
+| format-time-string | "%Y"            | "2026" (current)  |
+
+**** replace (10 tools)
+
+| Function                 | Input                   | Expected    |
+|--------------------------+-------------------------+-------------|
+| replace-regexp-in-string | "o", "0", "hello"       | "hell0"     |
+| regexp-quote             | "foo.bar"               | "foo\\.bar" |
+
+**** search (5 tools)
+
+Search functions operate on buffer positions and will error in a
+string-only dispatch.  Test that errors are graceful.
+
+**** cl (11 tools)
+
+| Function      | Input     | Expected |
+|---------------+-----------+----------|
+| cl-subseq     | "hello" 1 | "ello"   |
+| cl-coerce     | "abc" list | (a b c) |
+
+**** compose (9 tools)
+
+Font composition functions -- mostly GUI-dependent.  Test that they
+error gracefully in batch mode.
+
+** Tier 3: Property-Based Tests (invariants)
+:PROPERTIES:
+:ESTIMATED_TIME: ~5 minutes
+:FILE: tests/test-tier3-properties.el (future)
+:END:
+
+*** Goal
+
+Verify structural properties across entire tool families without
+knowing specific outputs.
+
+*** Invariant classes
+
+**** P1: Predicates always return t or nil
+
+#+begin_src elisp
+;; For every tool ending in -p:
+;;   (TOOL "anything") => result is "t" or "nil" (as string)
+;;   OR returns a graceful error
+#+end_src
+
+**** P2: String functions do not crash on empty string
+
+#+begin_src elisp
+;; For every string-* tool:
+;;   (TOOL "") => does not crash
+;;   (TOOL "hello") => does not crash
+#+end_src
+
+**** P3: Pure functions are idempotent
+
+#+begin_src elisp
+;; For known-pure functions (string-trim, upcase, downcase, etc.):
+;;   (TOOL (TOOL input)) => does not crash
+;;   For idempotent subset: (TOOL (TOOL input)) = (TOOL input)
+#+end_src
+
+**** P4: Output size is bounded
+
+#+begin_src elisp
+;; For string-* tools with 1 arg:
+;;   (length (TOOL input)) <= (* 10 (length input))
+;;   (catches accidental exponential expansion)
+#+end_src
+
+**** P5: Error responses are well-formed
+
+#+begin_src elisp
+;; For any tool that errors:
+;;   Response has isError = t
+;;   content[0].type = "text"
+;;   content[0].text starts with "error:"
+#+end_src
+
+** Tier 4: Fuzz Testing
+:PROPERTIES:
+:ESTIMATED_TIME: ~10-30 minutes (configurable)
+:FILE: tests/test-tier4-fuzz.el (future)
+:END:
+
+*** Goal
+
+Random inputs to random tools.  Verify the server never crashes and
+always produces valid JSON-RPC.
+
+*** Input generators
+
+| Generator   | Examples                               |
+|-------------+----------------------------------------|
+| empty       | ""                                     |
+| ascii       | "hello", "foo bar baz"                 |
+| unicode     | "\u6F22\u5B57", "\U0001F680"           |
+| special     | "\"", "\\", "\n", "\0"                 |
+| numeric-str | "42", "-1", "3.14", "1e100"            |
+| long        | (make-string 10000 ?x)                 |
+| lisp-like   | "(+ 1 1)", "'(a b c)", "#'car"         |
+
+*** Fuzz harness pseudo-code
+
+#+begin_src elisp
+(dotimes (_ 1000)
+  (let* ((tool (random-tool))
+         (nargs (random 4))
+         (args (generate-random-args nargs)))
+    (condition-case err
+        (emcp-stdio--handle-tools-call
+         (random 9999)
+         `((name . ,(alist-get 'name tool))
+           (arguments . ((args . ,(apply #'vector args))))))
+      (error (record-crash tool args err)))))
+#+end_src
+
+*** What it catches
+
+- Buffer overflow or unbounded recursion
+- Null byte handling failures (security surface)
+- Encoding errors on exotic unicode
+- State corruption from one call affecting the next
+
+* Batch Execution Plan
+
+** Tier 1 batching (for CI or constrained environments)
+
+Although Tier 1 runs all 779 tools in one process by default (which is
+the point -- testing that no tool corrupts state), for parallel
+execution or CI timeout management, tools can be batched:
+
+*** Strategy: Batch by index range
+
+#+begin_src shell
+# Run tools 0-49
+emacs --batch -Q \
+  -l src/emcp-stdio.el \
+  -l tests/test-tier1-smoke.el \
+  --eval '(setq emcp-test-tier1-batch-start 0 emcp-test-tier1-batch-size 50)' \
+  -f ert-run-tests-batch-and-exit
+
+# Run tools 50-99
+emacs --batch -Q \
+  -l src/emcp-stdio.el \
+  -l tests/test-tier1-smoke.el \
+  --eval '(setq emcp-test-tier1-batch-start 50 emcp-test-tier1-batch-size 50)' \
+  -f ert-run-tests-batch-and-exit
+#+end_src
+
+*** Parallelization
+
+#+begin_src shell
+# Run 16 batches of 50 in parallel (covers 800 tools)
+for i in $(seq 0 50 750); do
+  emacs --batch -Q \
+    -l src/emcp-stdio.el \
+    -l tests/test-tier1-smoke.el \
+    --eval "(setq emcp-test-tier1-batch-start $i emcp-test-tier1-batch-size 50)" \
+    -f ert-run-tests-batch-and-exit \
+    2>&1 | tee "tier1-batch-$i.log" &
+done
+wait
+#+end_src
+
+** Time estimates
+
+| Tier | Tools tested | Time per tool | Total estimate |
+|------+--------------+---------------+----------------|
+|    1 |          779 | ~200ms        | ~2.5 min       |
+|    2 |         ~165 | ~300ms        | ~1 min         |
+|    3 |         ~200 | ~500ms        | ~2 min         |
+|    4 |        ~1000 | ~200ms        | ~3-30 min      |
+
+** Reporting
+
+Test results should be collected as an org table:
+
+#+begin_src org
+| Tool Name            | Tier 1 | Tier 2 | Tier 3 | Notes          |
+|----------------------+--------+--------+--------+----------------|
+| string-trim          | PASS   | PASS   | PASS   |                |
+| string-reverse       | PASS   | PASS   | PASS   |                |
+| shell-command        | PASS   | SKIP   | SKIP   | dangerous      |
+| display-buffer       | PASS   | ERROR  | -      | needs display  |
+#+end_src
+
+The Tier 1 test emits a summary line:
+
+#+begin_example
+Tier 1: 770 ok, 9 graceful-errors, 0 crashes out of 779 tools
+#+end_example
+
+A *crash count of 0* is the pass condition.  Graceful errors (wrong
+number of arguments, wrong type, etc.) are expected and acceptable.
+
+* Dangerous Tools: Skip List
+
+The following tool patterns should be *skipped entirely* in automated
+testing or run only in sandboxed environments:
+
+| Pattern                   | Risk                      | Action     |
+|---------------------------+---------------------------+------------|
+| =shell-command*=          | Arbitrary shell exec      | skip       |
+| =call-process*=           | Process spawning          | skip       |
+| =start-process*=          | Process spawning          | skip       |
+| =start-file-process*=     | Process spawning          | skip       |
+| =async-shell-command=     | Async shell exec          | skip       |
+| =call-shell-region=       | Shell exec on region      | skip       |
+| =process-file*=           | File-level process exec   | skip       |
+| =send-string=             | Process I/O               | skip       |
+| =send-string-to-terminal= | Terminal control          | skip       |
+| =suspend-emacs=           | Suspends the process      | skip       |
+| =set-binary-mode=         | Terminal mode change      | skip       |
+| =gui-select-text=         | GUI clipboard             | skip       |
+| =x-select-text=           | X11 clipboard             | skip       |
+| =kill-buffer*=            | Destroys buffer context   | skip       |
+| =bury-buffer*=            | Rearranges buffer list    | skip       |
+
+The Tier 1 smoke test uses a skip list for these tools.  They are
+counted as "skipped" in the report, not as passes or failures.
+
+* Implementation Status
+
+| Artifact                      | Status  | File                        |
+|-------------------------------+---------+-----------------------------|
+| Strategy document             | DONE    | docs/test-strategy-800-tools.org |
+| Tier 1 smoke test             | DONE    | tests/test-tier1-smoke.el   |
+| Tier 2 category tests         | PLANNED | tests/test-tier2-categories.el |
+| Tier 3 property-based tests   | PLANNED | tests/test-tier3-properties.el |
+| Tier 4 fuzz tests             | PLANNED | tests/test-tier4-fuzz.el    |
+| CI integration (Makefile)     | PLANNED | Makefile                    |
+| Results org-table generator   | PLANNED | tests/test-report.el        |
