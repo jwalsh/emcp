@@ -1,0 +1,746 @@
+#+title: emcp-data-eval — Use Cases, System Barrier, and Distributed Org Memory
+#+subtitle: What eval means when it reaches across TRAMP, mDNS, and shared knowledge graphs
+#+author: jwalsh
+#+date: 2026-03-19
+#+property: header-args :mkdirp t
+#+property: header-args:emacs-lisp :lexical t :tangle yes
+#+property: header-args:python :tangle yes
+#+property: header-args:mermaid :file docs/diagrams/
+#+options: toc:3 num:t
+
+* Relationship to Parent Specs
+
+This is a tertiary spec scoped to one tool in the daemon data-layer:
+=emcp-data-eval=.  It exists because eval is not one tool — it is every
+tool, and the question of what the system barrier *is* gets weirder at
+each scope level.
+
+Parent documents:
+- =emacs-mcp-maximalist/spec.org= — protocol and obarray
+- =emcp-jitir-spec.org= — retrieval use cases, C-D conjecture series
+
+This spec addresses: what is =emcp-data-eval= allowed to do, to what,
+on behalf of whom, from where, and with what consequence.
+
+* The Core Tension
+
+=emcp-data-eval= takes a string, evaluates it as Elisp in the daemon,
+and returns the result.  That is the entire tool.
+
+The problem is that this description is also true of:
+- A SQL =EXECUTE= endpoint with no prepared statements
+- An authenticated SSH session
+- A Jupyter kernel with no kernel gateway
+- A shell with =eval=
+
+All of these are fine in the right context and catastrophic in the wrong
+one.  The right framing is not "is eval safe" but "what is the trust
+boundary and what crosses it."
+
+#+begin_quote
+eval is not a footgun.  eval aimed at production org files by an
+untrusted agent on a shared network is a footgun.  The boundary is the
+point.
+#+end_quote
+
+* Topology of Trust
+
+#+begin_src mermaid :file docs/diagrams/eval-trust-topology.png
+graph TD
+    subgraph T1["Tier 1 — personal local"]
+        L1[emcp-data-eval\nminibos daemon\nlocal org files\n→ full trust]
+    end
+
+    subgraph T2["Tier 2 — personal remote (TRAMP)"]
+        L2[emcp-data-eval\n/ssh:nexus:/data/org\nFreeBSD homelab\n→ trust = SSH key]
+    end
+
+    subgraph T3["Tier 3 — homelab mDNS"]
+        L3[emcp-data-eval\n_emcp._tcp.local\ndiscover peer daemons\n→ trust = network membership]
+    end
+
+    subgraph T4["Tier 4 — shared org corpus"]
+        L4[emcp-data-eval\nmultiple daemons\nsame org-roam directory\n→ trust = ??]
+    end
+
+    subgraph T5["Tier 5 — org org"]
+        L5[emcp-data-eval\nshared across org boundary\nmulti-user, multi-agent\n→ trust = none assumed]
+    end
+
+    T1 --> T2 --> T3 --> T4 --> T5
+    T4 -.->|"this is where\nit gets weird"| T5
+#+end_src
+
+Each tier adds a trust surface.  The design work is deciding which tiers
+=emcp-data-eval= should cross and at what capability level.
+
+* Tier 1: Personal Local
+
+** What it is
+
+The baseline case.  One human, one daemon, one org corpus, one machine.
+This is =emcp-jitir-spec.org= territory.  =emcp-data-eval= is essentially
+a stored-procedure interface to your personal knowledge graph.
+
+** What it can do (and should)
+
+Full capability.  No restrictions.  You are root on your own mind.
+
+#+begin_src emacs-lisp :tangle src/emcp-eval-tier1.el
+;;; emcp-eval-tier1.el — eval expressions appropriate for Tier 1 (personal local)
+;;; These assume full trust.  Do not expose at Tier 3+.
+
+;; Mutating: appropriate at Tier 1, carefully at Tier 2, never at Tier 3+
+(defun emcp-t1/clock-in-by-id (org-id)
+  "Clock into the heading identified by ORG-ID."
+  (org-id-goto org-id)
+  (org-clock-in))
+
+(defun emcp-t1/capture-to-inbox (text)
+  "Append TEXT as a new inbox entry."
+  (org-capture-string text "i"))  ; "i" = inbox template key
+
+(defun emcp-t1/set-property (org-id property value)
+  "Set PROPERTY to VALUE on heading ORG-ID."
+  (org-id-goto org-id)
+  (org-set-property property value))
+
+;; Read-only: safe at all tiers if output is non-sensitive
+(defun emcp-t1/current-clock ()
+  "Return the currently clocked heading, if any."
+  (when (org-clocking-p)
+    (list :heading (org-clock-get-clock-string)
+          :id      (org-id-get org-clock-marker)
+          :minutes (floor (org-clock-get-clocked-time)))))
+
+(defun emcp-t1/agenda-for-date (date-string)
+  "Return agenda items for DATE-STRING (org date format)."
+  (org-agenda-list nil date-string 1))
+#+end_src
+
+** The eval-as-query-language advantage
+
+At Tier 1, eval composes joins that no other retrieval system can
+express.  This is the core claim of =emcp-jitir-spec.org=.  A single
+=emcp-data-eval= call can:
+
+#+begin_src emacs-lisp :tangle no
+;; Example: "what was I working on when I made the auth decision?"
+;; This is a 3-table join: clock history × org-id graph × TODO state log
+(let* ((decision-id "a1b2c3d4-...")
+       (node (emcp-q/follow-id-link decision-id))
+       (related-clocks
+        (org-map-entries
+         (lambda ()
+           (when (member decision-id
+                         (mapcar #'org-element-property
+                                 (org-element-map
+                                     (org-element-parse-buffer) 'link
+                                   #'identity)))
+             (list :heading (org-get-heading t t t t)
+                   :clock   (org-clock-get-clocked-time))))
+         nil 'agenda)))
+  (list :decision node
+        :context  related-clocks))
+#+end_src
+
+No SQL schema. No embedding index. One call against the live parse tree.
+
+* Tier 2: Personal Remote via TRAMP
+
+** What TRAMP gives eval
+
+TRAMP paths are first-class in Emacs.  =find-file-noselect= with a TRAMP
+path loads the remote file into a local buffer, transparently.
+=emcp-data-eval= on the minibos daemon can therefore reach:
+
+#+begin_src emacs-lisp :tangle no
+;; nexus org files — FreeBSD homelab
+(find-file-noselect "/ssh:nexus:/data/org/projects/sprint-axiom.org")
+
+;; hydra — secondary homelab node
+(find-file-noselect "/ssh:hydra:/home/jwalsh/notes/research.org")
+
+;; Tailscale — same SSH key, different network
+(find-file-noselect "/ssh:minibos.tail.ts.net:/Users/jwalsh/org/capture.org")
+#+end_src
+
+The authentication is the SSH key.  The daemon inherits your key agent.
+There is no separate credential — the TRAMP connection *is* the auth.
+
+** The TRAMP eval surface
+
+#+begin_src emacs-lisp :tangle src/emcp-eval-tier2.el
+;;; emcp-eval-tier2.el — eval helpers that reach across TRAMP
+
+(defun emcp-t2/remote-org-headings (host path match)
+  "Return org headings matching MATCH in PATH on HOST via TRAMP."
+  (let ((tramp-path (format "/ssh:%s:%s" host path)))
+    (with-current-buffer (find-file-noselect tramp-path)
+      (org-map-entries
+       (lambda ()
+         (list :heading  (org-get-heading t t t t)
+               :level    (org-outline-level)
+               :state    (org-get-todo-state)
+               :file     tramp-path
+               :position (point)))
+       match))))
+
+(defun emcp-t2/diff-between-hosts (host-a path-a host-b path-b)
+  "Return structural diff of org headings between two remote files."
+  (let ((a (emcp-t2/remote-org-headings host-a path-a nil))
+        (b (emcp-t2/remote-org-headings host-b path-b nil)))
+    (list :only-in-a (cl-set-difference a b :key #'(lambda (h) (plist-get h :heading))
+                                        :test #'string=)
+          :only-in-b (cl-set-difference b a :key #'(lambda (h) (plist-get h :heading))
+                                        :test #'string=))))
+
+(defun emcp-t2/remote-eval (host sexp-string)
+  "Eval SEXP-STRING in a remote Emacs daemon on HOST via emacsclient."
+  ;; This is emcpclient over SSH — distinct from TRAMP file access.
+  ;; Requires the remote host to be running an Emacs daemon.
+  (let ((result (shell-command-to-string
+                 (format "ssh %s emacsclient --eval '%s'"
+                         host
+                         (replace-regexp-in-string "'" "'\\''" sexp-string t t)))))
+    (string-trim result)))
+#+end_src
+
+** What TRAMP eval is NOT
+
+TRAMP file access is read-mostly and pull-based.  =emcp-t2/remote-eval=
+is genuinely different: it reaches into the remote daemon's runtime and
+can mutate state there.  These need separate trust treatment.
+
+| Operation | TRAMP path | Remote daemon eval |
+|-----------+------------+--------------------|
+| Read file | ✅ safe   | ✅ safe (read-only sexp) |
+| Write file | ⚠️ scoped  | ⚠️ scoped (specific capture) |
+| Delete file | ❌ disallow | ❌ disallow |
+| Run shell | N/A        | ❌ disallow |
+| Clock mutation | N/A   | ⚠️ only own headings |
+| Org-id graph traversal | ✅ | ✅ |
+
+* Tier 3: mDNS — Discovering Peer Daemons
+
+** The mDNS proposal
+
+An Emacs daemon that wants to be discoverable on the local network
+publishes an Avahi service record of type =_emcp._tcp=.  Any node can
+then discover all reachable daemons without static configuration.
+
+#+begin_src xml :tangle etc/avahi/services/emcp.service
+<!-- /etc/avahi/services/emcp.service -->
+<!-- Drop on any host running emacs --daemon + emcp-stdio.el -->
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<service-group>
+  <name replace-wildcards="yes">emcp on %h</name>
+  <service>
+    <type>_emcp._tcp</type>
+    <port>0</port>  <!-- stdio, not TCP — port 0 signals stdio-only -->
+    <txt-record>version=0.1</txt-record>
+    <txt-record>host=%h</txt-record>
+    <txt-record>user=jwalsh</txt-record>
+    <txt-record>org-root=/data/org</txt-record>
+    <txt-record>daemon-pid=DYNAMIC</txt-record>
+    <txt-record>trust-tier=2</txt-record>  <!-- what this node exposes -->
+  </service>
+</service-group>
+#+end_src
+
+** Discovery in Elisp
+
+#+begin_src emacs-lisp :tangle src/emcp-mdns.el
+;;; emcp-mdns.el — discover peer Emacs daemons via mDNS / Avahi
+
+(defun emcp-mdns/discover ()
+  "Return list of reachable emcp services on local network.
+Requires avahi-browse on PATH."
+  (let ((output (shell-command-to-string
+                 "avahi-browse -t -r -p _emcp._tcp 2>/dev/null")))
+    (mapcar #'emcp-mdns--parse-record
+            (seq-filter (lambda (l) (string-prefix-p "=" l))
+                        (split-string output "\n" t)))))
+
+(defun emcp-mdns--parse-record (line)
+  "Parse an avahi-browse resolved record LINE into a plist."
+  ;; avahi-browse -p format: =;iface;proto;name;type;domain;host;addr;port;txt
+  (let ((parts (split-string line ";" t)))
+    (list :interface (nth 1 parts)
+          :name      (nth 3 parts)
+          :host      (nth 6 parts)
+          :address   (nth 7 parts)
+          :txt       (nth 9 parts))))
+
+(defun emcp-mdns/peer-org-roots ()
+  "Return alist of (hostname . org-root) for all discovered peers."
+  (mapcar (lambda (peer)
+            (let* ((txt   (plist-get peer :txt))
+                   (root  (when (string-match "org-root=\\([^ \"]+\\)" txt)
+                            (match-string 1 txt))))
+              (cons (plist-get peer :host) root)))
+          (emcp-mdns/discover)))
+
+(defun emcp-mdns/eval-on-peer (hostname sexp-string)
+  "Eval SEXP-STRING on the emcp daemon at HOSTNAME.
+HOSTNAME must be in emcp-mdns/discover results.
+Trust tier enforced by the remote host, not here."
+  (let ((peers (emcp-mdns/discover))
+        (target (seq-find (lambda (p)
+                            (string= (plist-get p :host) hostname))
+                          (emcp-mdns/discover))))
+    (if target
+        (emcp-t2/remote-eval hostname sexp-string)
+      (error "emcp: peer %s not found via mDNS" hostname))))
+#+end_src
+
+** What mDNS changes about the threat model
+
+At Tier 1 and 2, you are the only human with access.  mDNS discovery
+changes this: any node on the network can find your daemon.  The
+questions become:
+
+1. Who is allowed to call =emcp-data-eval= on my daemon?
+2. What is the peer allowed to do?
+3. What does "the network" mean — Tailscale mesh? LAN? Org network?
+
+The trust-tier TXT record in the Avahi service definition is the
+proposed answer: the publishing node declares what capability level it
+exposes to peers.  Tier 2 = TRAMP-equivalent (read + structured write).
+Tier 1 is not advertised to the network.
+
+** The aq integration point
+
+=aq= already broadcasts agent presence as NDJSON with TTL over the local
+network (or Tailscale mesh).  mDNS daemon discovery is the complement:
+aq says "this agent is working on X", mDNS says "there is an Emacs daemon
+at Y that knows about X."  Together they form:
+
+#+begin_src mermaid :file docs/diagrams/aq-mdns-integration.png
+sequenceDiagram
+    participant AQ as aq gossip
+    participant RA as Remembrance Agent (JITIR)
+    participant mDNS as mDNS / Avahi
+    participant D1 as minibos daemon
+    participant D2 as nexus daemon
+
+    AQ->>RA: agent broadcast: "working on sprint-axiom"
+    RA->>mDNS: discover: who knows about sprint-axiom?
+    mDNS->>RA: D1 (minibos.local), D2 (nexus.local)
+    RA->>D1: emcp-data-eval (org-map-entries "sprint-axiom")
+    RA->>D2: emcp-data-eval (org-map-entries "sprint-axiom")
+    D1-->>RA: local headings + clock history
+    D2-->>RA: remote headings + linked nodes
+    RA->>RA: merge, rank by recency + link depth
+    RA-->>AQ: context: 5 related nodes surfaced
+#+end_src
+
+This is the Remembrance Agent running across the homelab.  Not "what
+is in this buffer" but "what does the network know about what we are
+doing right now."
+
+* Tier 4: Shared Org Corpus
+
+** What it is
+
+Multiple daemons pointing at the same org-roam directory.  This is the
+case when:
+
+- minibos and nexus both mount the same NFS/Syncthing org directory
+- Two agents in different worktrees share an org agenda file
+- =aq= writes presence NDJSON into an org file that multiple daemons watch
+
+** The concurrency problems that don't exist yet but will
+
+Org-mode was designed for one writer.  The file locking model is Emacs
+file locks (=.#filename=) — advisory, not enforced.  When two daemons
+have the same file open:
+
+| Operation | Consequence |
+|-----------+-------------|
+| Both read | Fine |
+| One writes, one reads | Reader sees stale content or partial write |
+| Both write different headings | Last-writer-wins, possible interleave |
+| Both write same heading | Data loss |
+| One org-id-update-id-locations | Clobbers the other's cache |
+| Both clock in | Duplicate CLOCK entries, corrupted LOGBOOK |
+
+None of this is hypothetical.  =aq= agents in separate worktrees already
+write to shared state.  The bootstrap paradox surfaced in the four-agent
+worktree experiment is the same class of problem.
+
+** The only currently safe pattern
+
+Read-only queries from multiple daemons against a shared corpus are safe
+if no daemon is writing.  This is the JITIR retrieval case.
+
+#+begin_src emacs-lisp :tangle src/emcp-eval-tier4.el
+;;; emcp-eval-tier4.el — safe patterns for shared corpus access
+
+(defun emcp-t4/read-only-query (org-root match-string)
+  "Query a shared org corpus with a read-only org-map-entries.
+ORG-ROOT is the directory.  Does not modify any state."
+  (let ((org-agenda-files (directory-files-recursively
+                           org-root "\\.org$")))
+    (org-map-entries
+     (lambda ()
+       (list :heading  (org-get-heading t t t t)
+             :file     (buffer-file-name)
+             :level    (org-outline-level)
+             :tags     (org-get-tags)
+             :state    (org-get-todo-state)
+             :id       (org-id-get)))
+     match-string
+     'agenda)))
+
+(defun emcp-t4/check-lock (file)
+  "Return non-nil if FILE has an active Emacs lock."
+  (file-exists-p (expand-file-name
+                  (concat ".#" (file-name-nondirectory file))
+                  (file-name-directory file))))
+
+(defun emcp-t4/safe-capture (file heading-path text)
+  "Capture TEXT under HEADING-PATH in FILE only if no lock present."
+  (if (emcp-t4/check-lock file)
+      (list :status 'locked :file file :retry-after 5)
+    (with-current-buffer (find-file-noselect file)
+      (goto-char (point-min))
+      ;; navigate to heading-path...
+      (org-end-of-subtree)
+      (insert (format "\n** %s\n%s\n" (format-time-string "%Y-%m-%d") text))
+      (save-buffer)
+      (list :status 'ok :file file))))
+#+end_src
+
+** The CRDTs-in-org rabbit hole
+
+The principled solution to shared org mutation is CRDTs — convergent
+replicated data types.  The org-mode data model does not support this.
+The only practical paths currently are:
+
+1. *Append-only files*: each agent writes to its own capture file,
+   a reconciliation process merges periodically.  =aq= presence NDJSON
+   is already append-only by design.
+
+2. *Designated writer*: only one daemon (e.g., the daemon on the machine
+   currently being used) holds write access.  Others are read-only
+   queryers.  Enforced by Avahi trust-tier TXT record.
+
+3. *Optimistic locking via git*: all writes go through =git commit=.
+   Conflicts surface as merge conflicts.  Not realtime.
+
+4. *Inbox pattern*: agents write to =inbox.org= (append-only, low
+   conflict rate), a human or scheduled job promotes entries to their
+   permanent location.
+
+Path 1 + path 4 together is the current =aq= design.  Paths 2 and 3
+are Tier 4 extensions that need explicit conjecture instrumentation.
+
+* Tier 5: Org-Level Shared Memory
+
+** The inevitable weird thing
+
+At some point — and this is noted as "inevitable" in the spec title —
+the org corpus stops being one person's personal knowledge graph and
+becomes a shared artifact across an org (organization, not file format).
+
+This is already partially true:
+- Sprint planning in =sprint-axiom= involves shared hypotheses
+- CPRR conjectures are tracked collectively
+- =aq= presence is network-wide
+
+The question is whether =emcp-data-eval= should be able to query across
+the shared corpus *as if it were a single coherent database*.
+
+#+begin_src mermaid :file docs/diagrams/org-shared-memory.png
+graph LR
+    subgraph personal["Personal tier (opaque to network)"]
+        P1[capture.org\nraw notes]
+        P2[journal.org\nclocked time]
+        P3[private/**]
+    end
+
+    subgraph shared["Shared corpus (readable by org network)"]
+        S1[projects/sprint-axiom.org]
+        S2[conjectures/CPRR.org]
+        S3[aq/presence.ndjson.org]
+        S4[knowledge/decisions/**]
+    end
+
+    subgraph network["Org network eval surface"]
+        N1[emcp-data-eval\nread-only queries\nagainst shared/]
+        N2[emcp-t4/safe-capture\nappend to shared/inbox.org]
+    end
+
+    personal -.->|never crosses| network
+    shared --> network
+    N1 -->|mDNS discovery| shared
+    N2 -->|append-only| S3
+#+end_src
+
+The design constraint: the personal tier never crosses into the network
+eval surface.  A peer daemon discovers and queries the shared corpus only.
+Your =journal.org= and =private/= are not in scope regardless of mDNS
+trust tier.
+
+** What this looks like in practice for the homelab
+
+#+begin_src emacs-lisp :tangle src/emcp-eval-tier5.el
+;;; emcp-eval-tier5.el — org-network queries against shared corpus
+
+(defvar emcp-t5/shared-root
+  "/data/org/shared"
+  "Root of the shared org corpus, same path on all nodes.")
+
+(defvar emcp-t5/personal-roots
+  '("/Users/jwalsh/org/private"
+    "/Users/jwalsh/org/journal")
+  "Paths that must never be exposed to network eval.")
+
+(defun emcp-t5/safe-p (path)
+  "Return non-nil if PATH is within the shared corpus (not personal)."
+  (and (string-prefix-p emcp-t5/shared-root
+                        (expand-file-name path))
+       (not (seq-some (lambda (priv)
+                        (string-prefix-p priv (expand-file-name path)))
+                      emcp-t5/personal-roots))))
+
+(defun emcp-t5/network-query (match-string)
+  "Query the shared corpus for MATCH-STRING headings.
+Only returns results from emcp-t5/shared-root.
+Safe for Tier 3+ peers."
+  (let ((org-agenda-files
+         (seq-filter #'emcp-t5/safe-p
+                     (directory-files-recursively
+                      emcp-t5/shared-root "\\.org$"))))
+    (org-map-entries
+     (lambda ()
+       (list :heading (org-get-heading t t t t)
+             :file    (file-relative-name (buffer-file-name)
+                                          emcp-t5/shared-root)
+             :state   (org-get-todo-state)
+             :tags    (org-get-tags)))
+     match-string
+     'agenda)))
+
+(defun emcp-t5/aq-presence-as-org ()
+  "Read current aq presence NDJSON and return as org-structured data.
+This is the RA integration point: what is the network working on?"
+  (let ((aq-file (expand-file-name "aq/presence.ndjson"
+                                   emcp-t5/shared-root)))
+    (when (file-exists-p aq-file)
+      (with-temp-buffer
+        (insert-file-contents aq-file)
+        (let (peers)
+          (while (not (eobp))
+            (let ((line (buffer-substring (line-beginning-position)
+                                          (line-end-position))))
+              (when (> (length line) 0)
+                (push (json-parse-string line :object-type 'plist)
+                      peers)))
+            (forward-line 1))
+          (nreverse peers))))))
+#+end_src
+
+* The System Barrier — Formal Statement
+
+There is no single system barrier for =emcp-data-eval=.  There is a
+*capability ladder*, and the barrier is a policy choice at each rung.
+
+#+begin_src mermaid :file docs/diagrams/eval-capability-ladder.png
+graph TD
+    E0["Tier 0 — eval disabled\nbatch mode only, no daemon\n→ 779 pure tools, no data layer"]
+    E1["Tier 1 — full eval\npersonal local, trusted agent\n→ read + mutate + shell blocked"]
+    E2["Tier 2 — TRAMP eval\npersonal remote via SSH\n→ read + structured write\nshell blocked, delete blocked"]
+    E3["Tier 3 — mDNS peer eval\nhomelab network member\n→ read-only shared corpus\nno mutation, no personal paths"]
+    E4["Tier 4 — shared corpus eval\nmulti-daemon, same org directory\n→ append-only writes, lock-checked\nconcurrency tracked"]
+    E5["Tier 5 — org network eval\nshared across org boundary\n→ read-only, no personal data\npath allowlist enforced"]
+
+    E0 --> E1 --> E2 --> E3 --> E4 --> E5
+
+    style E0 fill:none,stroke-dasharray:4 4
+    style E1 fill:none
+    style E2 fill:none
+    style E3 fill:none
+    style E4 fill:none,stroke-width:2
+    style E5 fill:none,stroke-dasharray:2 2
+#+end_src
+
+** What is always blocked regardless of tier
+
+These are not conjectures.  They are policy.  Any =emcp-data-eval= call
+that touches them is rejected before eval:
+
+#+begin_src emacs-lisp :tangle src/emcp-eval-barrier.el
+;;; emcp-eval-barrier.el — static eval filter for emcp-data-eval
+;;; Called before (eval (read sexp-string)) in emcp-stdio.el
+
+(defvar emcp-barrier/blocked-functions
+  '(shell-command
+    shell-command-to-string
+    call-process
+    call-process-region
+    start-process
+    make-process
+    delete-file
+    delete-directory
+    rename-file
+    copy-file
+    write-region                        ; only via structured capture tools
+    set-file-modes
+    dired-delete-file)
+  "Functions that must never appear in a network eval call.
+These are blocked at all tiers above Tier 1.")
+
+(defvar emcp-barrier/blocked-patterns
+  '("\\bshell\\b"
+    "\\bprocess\\b"
+    "\\bdelete-file\\b"
+    "\\bwrite-region\\b"
+    "\\brm\\b"
+    "\\bsudo\\b"
+    "exec")
+  "Regexp patterns that trigger eval rejection.
+Conservative — false positives preferred over false negatives.")
+
+(defun emcp-barrier/safe-p (sexp-string tier)
+  "Return non-nil if SEXP-STRING is safe to eval at TIER.
+TIER is an integer 1-5 corresponding to the capability ladder."
+  (cond
+   ((= tier 1) t)  ; full trust at Tier 1 — no filter
+   (t
+    (not (or
+          ;; Check for blocked function names
+          (seq-some (lambda (fn)
+                      (string-match-p (regexp-quote (symbol-name fn))
+                                      sexp-string))
+                    emcp-barrier/blocked-functions)
+          ;; Check for blocked patterns
+          (seq-some (lambda (pat)
+                      (string-match-p pat sexp-string))
+                    emcp-barrier/blocked-patterns))))))
+
+(defun emcp-barrier/personal-path-p (sexp-string)
+  "Return non-nil if SEXP-STRING references a personal (non-shared) path."
+  (seq-some (lambda (path)
+              (string-match-p (regexp-quote path) sexp-string))
+            (bound-and-true-p emcp-t5/personal-roots)))
+#+end_src
+
+** What the barrier cannot catch
+
+Static analysis of eval is not decidable.  An adversarial sexp can
+always find a path around a pattern filter:
+
+#+begin_src emacs-lisp :tangle no
+;; Naive filter blocks "shell-command" literally.
+;; This bypasses it:
+(funcall (intern (concat "shell" "-command")) "rm -rf ~")
+
+;; Or via apply:
+(apply #'delete-file '("/important/file"))
+
+;; Or via let-binding over a blocked symbol
+(let ((f #'shell-command)) (funcall f "bad things"))
+#+end_src
+
+This is why the barrier is defense-in-depth, not a security guarantee.
+The real security is:
+1. Who has network access to the mDNS service (Tailscale mesh = known
+   hosts only)
+2. Who has the SSH key (personal, not shared)
+3. What the org-root allowlist contains
+
+The filter buys you protection against accidental or confused agents.
+It does not protect against adversarial ones on a trusted network.
+
+* Conjectures (C-E series — eval contract)
+
+| ID | Claim | Status |
+|-------+-------+--------|
+| C-E001 | The blocked-patterns filter produces <5% false positive rate on legitimate org-map-entries queries | open |
+| C-E002 | TRAMP eval (Tier 2) has higher latency than local eval by >10x due to SSH handshake amortization | open |
+| C-E003 | The org-id-locations cache on minibos correctly resolves IDs in files loaded via TRAMP from nexus | open |
+| C-E004 | avahi-browse returns emcp peers within 500ms on the Tailscale mesh | open |
+| C-E005 | Two daemons querying the same org-roam directory simultaneously produce no data corruption for read-only queries | open |
+| C-E006 | The append-only capture pattern (emcp-t4/safe-capture) achieves conflict-free writes at <10 ops/minute | open |
+| C-E007 | aq presence NDJSON as org-structured data is parseable by emcp-t5/aq-presence-as-org without loss | open |
+| C-E008 | Adversarial bypass of emcp-barrier/safe-p is possible (expected: yes — document the vector) | open |
+| C-E009 | A static allowlist of ~30 read-only org functions covers 90%+ of legitimate JITIR queries | open |
+| C-E010 | mDNS service advertisement of _emcp._tcp is stable across Tailscale re-keying events | open |
+
+* Open Design Questions
+
+These are architectural choices, not falsifiable predictions.
+
+** Q1: Allowlist vs blocklist
+
+The current =emcp-barrier/safe-p= is a blocklist.  The safe alternative
+for Tier 3+ is an allowlist of exactly which functions are permitted:
+=org-map-entries=, =org-get-heading=, =org-id-find=, etc.  An allowlist
+is stronger but requires maintenance as the query library grows.  The
+blocklist approach is consistent with how firewalls work in practice —
+deny-by-default with explicit allow is the right direction but costs
+enumeration effort.
+
+The conjectured resolution: C-E009 tests whether the allowlist is
+tractable.  If 90%+ of real queries fit ~30 functions, the allowlist
+is worth building.
+
+** Q2: Where does the barrier live?
+
+Option A: in =emcp-stdio.el= before =funcall= — single enforcement point,
+but requires the server to be aware of trust tier.
+
+Option B: in the MCP client (=emcp_client.py=) before sending the call —
+the client enforces tier-appropriate queries, the server trusts the client.
+
+Option C: in a Bastille jail (=bastille-claude-sandbox=) — filesystem-level
+containment prevents the consequences of a barrier bypass, even if eval
+itself isn't filtered.
+
+Options A and C are complementary.  Option B is defense-in-depth but
+relies on the client being uncompromised.  For the homelab at Tier 1-2,
+A is sufficient.  For Tier 3+, C is the right answer.
+
+** Q3: The aq integration interface
+
+=aq= presence NDJSON contains: agent ID, worktree, current task, TTL,
+timestamp.  The =emcp-t5/aq-presence-as-org= function reads this and
+returns structured data.  The question is directionality:
+
+- Does the RA query aq to find what is being worked on, then query emcp
+  for related history? (pull model, current proposal)
+- Does aq proactively push to the RA when new presence is broadcast?
+  (push model, more like the original Remembrance Agent)
+- Does emcp-data-eval subscribe to aq presence changes via a watch/notify
+  pattern? (reactive model)
+
+The push and reactive models require aq to have a callback or webhook
+interface.  The TTL-based NDJSON model is currently pull-only.  This is
+a design question for =aq= as much as for emcp.
+
+** Q4: What does "shared memory" mean at Tier 5?
+
+The spec uses "org-level shared memory" loosely.  The concrete variants
+are, in order of implementation cost:
+
+1. *Shared read-only query surface*: peers can query each other's shared
+   corpus but not write. Low cost, high safety.
+
+2. *Federated org-id namespace*: org-id links in one person's notes
+   resolve to nodes in another's corpus. Requires coordination of UUID
+   namespaces. Medium cost.
+
+3. *Shared writeable corpus*: multiple users contribute to the same
+   org-roam directory. High cost, requires CRDT or strict append-only.
+
+4. *Ambient mutual Remembrance Agent*: each node's current work context
+   is visible to all peers, who surface related knowledge from their own
+   graphs. Requires aq + mDNS + emcp all composing correctly. This is
+   the end state described in the conversation that generated this spec.
+
+The recommendation: implement in order, validate each tier's conjectures
+before proceeding to the next.  Tier 5/Q4-4 is the destination but it
+is not the starting point.

@@ -1,0 +1,855 @@
+#+title: emcp-observability — Instrumentation, Alerting, and Runbooks
+#+subtitle: OTel + Grafana for the emcp presence layer; written for Grafana & Friends Boston 2026-03-19
+#+author: jwalsh
+#+date: 2026-03-19
+#+property: header-args :mkdirp t
+#+property: header-args:python :tangle yes
+#+property: header-args:emacs-lisp :lexical t :tangle yes
+#+property: header-args:yaml :tangle yes
+#+property: header-args:mermaid :file docs/diagrams/
+#+options: toc:3 num:t
+
+* Context
+
+Written the same evening as the Grafana & Friends Boston meetup
+(AI in Observability, CarGurus office, 2026-03-19).
+
+The thesis: emcp-presence is a distributed system.  Distributed systems
+fail silently.  The first observable failure is "the Remembrance Agent
+surfaced nothing" — which is indistinguishable from "the corpus has no
+relevant history" without instrumentation.  That ambiguity is the
+observability problem.
+
+This spec treats emcp as a production system and applies the same
+discipline that Cast AI applies to Grafana-in-Kubernetes: right-size
+the observability stack for actual usage patterns, don't instrument
+everything, instrument the things that break silently.
+
+* What Can Fail Silently
+
+Before writing a single metric, enumerate the failure modes that are
+not self-announcing:
+
+| Component | Silent failure mode | Symptom if unobserved |
+|-----------+---------------------+-----------------------|
+| Emacs daemon | not running | eval calls hang or error |
+| avahi-daemon | not running | discover returns empty list |
+| mDNS TXT update | stale (publisher crashed) | peers see wrong task |
+| aq → mDNS sync timer | cancelled | presence data diverges from aq NDJSON |
+| TRAMP connection | timed out, not retried | query-peer returns error once, silently drops |
+| org-id-locations | not warmed | structural queries return empty |
+| nss-mdns | not configured | .local resolution fails, TRAMP paths fail |
+| Tier 3 barrier | misconfigured | either blocks valid queries or allows bad ones |
+
+Observability goal: make all eight failure modes detectable within 60
+seconds without human inspection.
+
+* OTel Instrumentation
+
+** Metric naming convention
+
+All emcp metrics use the prefix =emcp.=  Subsystems:
+
+| Prefix | Subsystem |
+|--------+-----------|
+| =emcp.daemon.= | Emacs daemon health |
+| =emcp.presence.= | mDNS presence / aq sync |
+| =emcp.eval.= | emcp-data-eval call metrics |
+| =emcp.query.= | emcp-presence-query (peer eval) |
+| =emcp.tramp.= | TRAMP connection metrics |
+
+** Python OTel exporter (emcp-otel bridge)
+
+The emcp system is primarily Elisp, but OTel SDKs are mature in Python.
+A thin bridge process scrapes emcp state via =emacsclient= and exports
+metrics to an OTel collector.
+
+#+begin_src python :tangle src/emcp_otel.py
+"""emcp_otel.py — OpenTelemetry bridge for emcp metrics.
+
+Scrapes emcp state via emacsclient and exports to OTel collector.
+Run alongside the Emacs daemon:
+
+    python src/emcp_otel.py --interval 15 --endpoint http://localhost:4317
+
+Metrics exported:
+    emcp.daemon.up                  gauge  1 if daemon responding, 0 otherwise
+    emcp.daemon.tool_count          gauge  number of MCP tools registered
+    emcp.presence.peer_count        gauge  active mDNS peers (ts < 5min)
+    emcp.presence.stale_peer_count  gauge  stale peers (ts >= 5min)
+    emcp.presence.last_broadcast_age_seconds gauge  seconds since last broadcast
+    emcp.eval.calls_total           counter  total emcp-data-eval calls
+    emcp.eval.errors_total          counter  eval calls that returned error
+    emcp.eval.duration_seconds      histogram  eval call latency
+    emcp.query.calls_total          counter  emcp-presence-query calls
+    emcp.query.duration_seconds     histogram  cross-peer query latency
+    emcp.tramp.connections_active   gauge  open TRAMP connections
+    emcp.org.index_warm             gauge  1 if org-id-locations populated
+"""
+
+import argparse
+import subprocess
+import time
+import json
+import sys
+from typing import Optional
+
+from opentelemetry import metrics
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+
+
+# ── emacsclient helpers ────────────────────────────────────────────────────
+
+def emacs_eval(sexp: str, timeout: int = 5) -> Optional[str]:
+    """Evaluate SEXP via emacsclient. Returns None on failure."""
+    try:
+        r = subprocess.run(
+            ["emacsclient", "--eval", sexp],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if r.returncode == 0:
+            return r.stdout.strip()
+        return None
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+
+def daemon_up() -> bool:
+    return emacs_eval("(emacs-pid)") is not None
+
+
+def tool_count() -> int:
+    raw = emacs_eval("(length (emcp-stdio--build-tool-list))")
+    try:
+        return int(raw) if raw else 0
+    except ValueError:
+        return 0
+
+
+def org_index_warm() -> bool:
+    raw = emacs_eval(
+        "(and (boundp 'org-id-locations) "
+        "     (hash-table-p org-id-locations) "
+        "     (> (hash-table-count org-id-locations) 0))"
+    )
+    return raw not in (None, "nil")
+
+
+def tramp_connections() -> int:
+    raw = emacs_eval("(length (tramp-list-connections))")
+    try:
+        return int(raw) if raw else 0
+    except ValueError:
+        return 0
+
+
+# ── mDNS helpers ─────────────────────────────────────────────────────────
+
+def mdns_peers() -> list[dict]:
+    """Return parsed _emcp._tcp peers via avahi-browse."""
+    try:
+        raw = subprocess.run(
+            ["avahi-browse", "-t", "-r", "-p", "_emcp._tcp"],
+            capture_output=True, text=True, timeout=3,
+        ).stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return []
+
+    peers = []
+    now = int(time.time())
+    for line in raw.splitlines():
+        if not line.startswith("="):
+            continue
+        parts = line.split(";")
+        if len(parts) < 10:
+            continue
+        txt = ";".join(parts[9:])
+        ts_match = next(
+            (p.split("=", 1)[1] for p in txt.split('" "') if p.startswith("ts=")),
+            "0",
+        )
+        try:
+            ts = int(ts_match.strip('"'))
+        except ValueError:
+            ts = 0
+        peers.append({"host": parts[6], "ts": ts, "age": now - ts})
+    return peers
+
+
+def last_broadcast_age(aq_file: str) -> Optional[int]:
+    """Return seconds since the last aq NDJSON entry was written."""
+    try:
+        import os
+        mtime = os.path.getmtime(aq_file)
+        return int(time.time() - mtime)
+    except (FileNotFoundError, OSError):
+        return None
+
+
+# ── OTel setup ────────────────────────────────────────────────────────────
+
+def setup_otel(endpoint: str) -> metrics.Meter:
+    exporter = OTLPMetricExporter(endpoint=endpoint, insecure=True)
+    reader   = PeriodicExportingMetricReader(exporter, export_interval_millis=15_000)
+    provider = MeterProvider(metric_readers=[reader])
+    metrics.set_meter_provider(provider)
+    return metrics.get_meter("emcp", version="0.1")
+
+
+def register_metrics(meter: metrics.Meter) -> dict:
+    return {
+        "daemon_up": meter.create_gauge(
+            "emcp.daemon.up",
+            description="1 if Emacs daemon responding to emacsclient",
+        ),
+        "tool_count": meter.create_gauge(
+            "emcp.daemon.tool_count",
+            description="Number of MCP tools registered in emcp-stdio.el",
+        ),
+        "peer_count": meter.create_gauge(
+            "emcp.presence.peer_count",
+            description="Active mDNS peers (ts < 300s ago)",
+        ),
+        "stale_count": meter.create_gauge(
+            "emcp.presence.stale_peer_count",
+            description="Stale mDNS peers (ts >= 300s ago)",
+        ),
+        "broadcast_age": meter.create_gauge(
+            "emcp.presence.last_broadcast_age_seconds",
+            description="Seconds since last aq presence broadcast",
+        ),
+        "org_warm": meter.create_gauge(
+            "emcp.org.index_warm",
+            description="1 if org-id-locations is populated",
+        ),
+        "tramp_conns": meter.create_gauge(
+            "emcp.tramp.connections_active",
+            description="Open TRAMP connections",
+        ),
+    }
+
+
+# ── scrape loop ───────────────────────────────────────────────────────────
+
+def scrape(gauges: dict, aq_file: str, attrs: dict) -> None:
+    up = daemon_up()
+    gauges["daemon_up"].set(1 if up else 0, attrs)
+
+    if up:
+        gauges["tool_count"].set(tool_count(), attrs)
+        gauges["org_warm"].set(1 if org_index_warm() else 0, attrs)
+        gauges["tramp_conns"].set(tramp_connections(), attrs)
+
+    peers = mdns_peers()
+    active = [p for p in peers if p["age"] < 300]
+    stale  = [p for p in peers if p["age"] >= 300]
+    gauges["peer_count"].set(len(active), attrs)
+    gauges["stale_count"].set(len(stale), attrs)
+
+    age = last_broadcast_age(aq_file)
+    if age is not None:
+        gauges["broadcast_age"].set(age, attrs)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--interval",  type=int,   default=15)
+    ap.add_argument("--endpoint",  default="http://localhost:4317")
+    ap.add_argument("--aq-file",   default="~/.aq/channels/broadcast/presence.ndjson")
+    ap.add_argument("--host",      default=None)
+    args = ap.parse_args()
+
+    import os, socket
+    host   = args.host or socket.gethostname()
+    aq_file = os.path.expanduser(args.aq_file)
+    attrs  = {"host": host}
+
+    meter  = setup_otel(args.endpoint)
+    gauges = register_metrics(meter)
+
+    print(f"emcp-otel: scraping every {args.interval}s → {args.endpoint}",
+          file=sys.stderr)
+    while True:
+        try:
+            scrape(gauges, aq_file, attrs)
+        except Exception as exc:
+            print(f"emcp-otel: scrape error: {exc}", file=sys.stderr)
+        time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    main()
+#+end_src
+
+** Elisp side: eval instrumentation
+
+The OTel bridge scrapes passively.  For eval latency and error counts,
+instrument from within =emcp-stdio.el= using a simple ring buffer that
+the bridge can read.
+
+#+begin_src emacs-lisp :tangle src/emcp-metrics.el
+;;; emcp-metrics.el — lightweight in-process metrics for emcp-data-eval
+;;; Ring buffer of recent calls; scraped by emcp-otel.py via emacsclient.
+
+(defvar emcp-metrics/eval-calls    0   "Total emcp-data-eval calls.")
+(defvar emcp-metrics/eval-errors   0   "Total emcp-data-eval calls that errored.")
+(defvar emcp-metrics/eval-ring     []  "Ring buffer of recent eval durations (ms).")
+(defvar emcp-metrics/eval-ring-max 100 "Ring buffer capacity.")
+
+(defun emcp-metrics/record-eval (duration-ms error-p)
+  "Record one emcp-data-eval call of DURATION-MS milliseconds.
+ERROR-P non-nil if the call returned an error."
+  (cl-incf emcp-metrics/eval-calls)
+  (when error-p (cl-incf emcp-metrics/eval-errors))
+  (setq emcp-metrics/eval-ring
+        (vconcat (if (>= (length emcp-metrics/eval-ring)
+                         emcp-metrics/eval-ring-max)
+                     (seq-drop emcp-metrics/eval-ring 1)
+                   emcp-metrics/eval-ring)
+                 (vector duration-ms))))
+
+(defun emcp-metrics/snapshot ()
+  "Return current metrics as a JSON string for emacsclient scraping."
+  (json-encode
+   `((eval_calls   . ,emcp-metrics/eval-calls)
+     (eval_errors  . ,emcp-metrics/eval-errors)
+     (eval_p50_ms  . ,(emcp-metrics--percentile emcp-metrics/eval-ring 0.50))
+     (eval_p95_ms  . ,(emcp-metrics--percentile emcp-metrics/eval-ring 0.95))
+     (eval_p99_ms  . ,(emcp-metrics--percentile emcp-metrics/eval-ring 0.99))
+     (tool_count   . ,(condition-case nil
+                          (length (emcp-stdio--build-tool-list)) (error 0)))
+     (org_warm     . ,(if (and (boundp 'org-id-locations)
+                               (hash-table-p org-id-locations)
+                               (> (hash-table-count org-id-locations) 0))
+                          t nil))
+     (ts           . ,(floor (float-time))))))
+
+(defun emcp-metrics--percentile (vec p)
+  "Return the P-th percentile of VEC (sorted ascending)."
+  (if (zerop (length vec))
+      0
+    (let* ((sorted (sort (append vec nil) #'<))
+           (idx    (min (floor (* p (length sorted)))
+                        (1- (length sorted)))))
+      (nth idx sorted))))
+#+end_src
+
+* Grafana Dashboard
+
+** =docker-compose.yml= for local stack
+
+#+begin_src yaml :tangle docker/docker-compose.yml
+version: "3.8"
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.97.0
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol-contrib/config.yaml
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    networks: [emcp]
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    networks: [emcp]
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+    volumes:
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus]
+    networks: [emcp]
+
+networks:
+  emcp:
+    driver: bridge
+#+end_src
+
+#+begin_src yaml :tangle docker/otel-collector.yaml
+receivers:
+  otlp:
+    protocols:
+      grpc: { endpoint: "0.0.0.0:4317" }
+      http: { endpoint: "0.0.0.0:4318" }
+
+exporters:
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+    namespace: emcp
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    metrics:
+      receivers:  [otlp]
+      exporters:  [prometheus, debug]
+#+end_src
+
+** Dashboard JSON (key panels)
+
+The full JSON is too large for this spec.  Key panels and their PromQL:
+
+#+begin_src yaml :tangle grafana/dashboards/emcp-presence.yaml
+# Grafana dashboard provisioning config
+apiVersion: 1
+providers:
+  - name: emcp
+    folder: emcp
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards
+#+end_src
+
+Panel definitions:
+
+| Panel title | Type | PromQL |
+|-------------+------+--------|
+| Daemon health | stat | =emcp_daemon_up= |
+| MCP tool count | stat | =emcp_daemon_tool_count= |
+| Active peers | time series | =emcp_presence_peer_count= |
+| Broadcast age | gauge | =emcp_presence_last_broadcast_age_seconds= |
+| Eval p95 latency | time series | =histogram_quantile(0.95, rate(emcp_eval_duration_seconds_bucket[5m]))= |
+| Eval error rate | time series | =rate(emcp_eval_errors_total[5m]) / rate(emcp_eval_calls_total[5m])= |
+| Stale peers | time series | =emcp_presence_stale_peer_count= |
+| Org index warm | stat | =emcp_org_index_warm= |
+
+#+begin_src mermaid :file docs/diagrams/grafana-dashboard-layout.png
+graph TD
+    subgraph row1["Row 1 — Health (RED)"]
+        P1["🟢 Daemon up\nstat"]
+        P2["🔢 Tool count\nstat: 779+"]
+        P3["🌡️ Org index\nstat: warm/cold"]
+        P4["🔗 TRAMP conns\nstat"]
+    end
+
+    subgraph row2["Row 2 — Presence"]
+        P5["👥 Active peers\ntime series"]
+        P6["⏱️ Broadcast age\ngauge: 0–600s"]
+        P7["💤 Stale peers\ntime series"]
+    end
+
+    subgraph row3["Row 3 — Eval Performance"]
+        P8["📊 Eval p50/p95/p99\ntime series"]
+        P9["❌ Error rate\ntime series"]
+        P10["🔍 Query latency\ntime series (peer eval)"]
+    end
+
+    subgraph row4["Row 4 — aq / mDNS"]
+        P11["📡 mDNS peer list\ntable: host / task / age"]
+        P12["🔄 Sync timer\nstat: running/stopped"]
+        P13["📝 Last aq entry\ntext panel"]
+    end
+#+end_src
+
+* Alerting Rules
+
+#+begin_src yaml :tangle grafana/alerting/emcp-alerts.yaml
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: emcp
+    folder: emcp
+    interval: 1m
+    rules:
+
+      - uid: emcp-daemon-down
+        title: "emcp daemon not responding"
+        condition: C
+        data:
+          - refId: A
+            queryType: ""
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "emcp_daemon_up"
+              legendFormat: "{{host}}"
+          - refId: C
+            queryType: ""
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: "__expr__"
+            model:
+              conditions:
+                - evaluator: { params: [1], type: lt }
+                  operator:  { type: and }
+                  query:     { params: [A] }
+                  reducer:   { params: [], type: last }
+                  type: query
+              type: classic_conditions
+        noDataState:  Alerting
+        execErrState: Alerting
+        for: 2m
+        annotations:
+          summary: "Emacs daemon on {{ $labels.host }} is not responding"
+          runbook_url: "https://github.com/jwalsh/emacs-mcp-maximalist/blob/main/docs/runbooks/daemon-down.md"
+        labels:
+          severity: critical
+          component: emcp-daemon
+
+      - uid: emcp-broadcast-stale
+        title: "emcp presence broadcast stale (>10 min)"
+        condition: C
+        data:
+          - refId: A
+            queryType: ""
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "emcp_presence_last_broadcast_age_seconds"
+          - refId: C
+            queryType: ""
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: "__expr__"
+            model:
+              conditions:
+                - evaluator: { params: [600], type: gt }
+                  operator:  { type: and }
+                  query:     { params: [A] }
+                  reducer:   { params: [], type: last }
+                  type: query
+              type: classic_conditions
+        for: 5m
+        annotations:
+          summary: "aq → mDNS sync has not broadcast in {{ $value | humanizeDuration }}"
+          runbook_url: "https://github.com/jwalsh/emacs-mcp-maximalist/blob/main/docs/runbooks/broadcast-stale.md"
+        labels:
+          severity: warning
+          component: emcp-presence
+
+      - uid: emcp-no-peers
+        title: "No active emcp peers on network"
+        condition: C
+        data:
+          - refId: A
+            queryType: ""
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "emcp_presence_peer_count"
+          - refId: C
+            queryType: ""
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: "__expr__"
+            model:
+              conditions:
+                - evaluator: { params: [1], type: lt }
+                  operator:  { type: and }
+                  query:     { params: [A] }
+                  reducer:   { params: [], type: last }
+                  type: query
+              type: classic_conditions
+        for: 5m
+        annotations:
+          summary: "No active emcp peers visible on network — Remembrance Agent has no retrieval targets"
+          runbook_url: "https://github.com/jwalsh/emacs-mcp-maximalist/blob/main/docs/runbooks/no-peers.md"
+        labels:
+          severity: warning
+          component: emcp-presence
+
+      - uid: emcp-eval-error-rate
+        title: "emcp eval error rate > 10%"
+        condition: C
+        data:
+          - refId: A
+            queryType: ""
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "rate(emcp_eval_errors_total[5m]) / rate(emcp_eval_calls_total[5m])"
+          - refId: C
+            queryType: ""
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: "__expr__"
+            model:
+              conditions:
+                - evaluator: { params: [0.1], type: gt }
+                  operator:  { type: and }
+                  query:     { params: [A] }
+                  reducer:   { params: [], type: last }
+                  type: query
+              type: classic_conditions
+        for: 5m
+        annotations:
+          summary: "emcp-data-eval error rate is {{ $value | humanizePercentage }}"
+          runbook_url: "https://github.com/jwalsh/emacs-mcp-maximalist/blob/main/docs/runbooks/eval-errors.md"
+        labels:
+          severity: warning
+          component: emcp-eval
+
+      - uid: emcp-org-cold
+        title: "org-id index not warmed"
+        condition: C
+        data:
+          - refId: A
+            queryType: ""
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "emcp_org_index_warm"
+          - refId: C
+            queryType: ""
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: "__expr__"
+            model:
+              conditions:
+                - evaluator: { params: [1], type: lt }
+                  operator:  { type: and }
+                  query:     { params: [A] }
+                  reducer:   { params: [], type: last }
+                  type: query
+              type: classic_conditions
+        for: 10m
+        annotations:
+          summary: "org-id-locations not populated after 10 minutes — structural queries will return empty"
+          runbook_url: "https://github.com/jwalsh/emacs-mcp-maximalist/blob/main/docs/runbooks/org-cold.md"
+        labels:
+          severity: warning
+          component: emcp-jitir
+#+end_src
+
+* Runbooks
+
+** RB-001: Daemon Down
+
+#+begin_src markdown :tangle docs/runbooks/daemon-down.md
+# RB-001: emcp daemon not responding
+
+**Alert**: `emcp-daemon-down`
+**Severity**: critical
+**Component**: emcp-daemon
+
+## What this means
+
+`emacsclient --eval "(emacs-pid)"` is returning non-zero or timing out.
+All emcp-data-eval calls will fail. The Remembrance Agent has no
+retrieval backend. emcp-presence-query to this host will fail.
+
+## Immediate diagnosis
+
+```bash
+# Check if daemon process exists
+ps aux | grep "emacs --daemon"
+
+# Check socket
+ls -la /tmp/emacs$(id -u)/server 2>/dev/null || echo "no socket"
+
+# Try direct emacsclient
+emacsclient --eval "(emacs-pid)" 2>&1
+```
+
+## Resolution
+
+```bash
+# Start daemon
+emacs --daemon
+
+# Verify
+emacsclient --eval "(emacs-pid)"
+
+# Reload emcp-stdio.el
+emacsclient --eval '(load-file "~/src/emacs-mcp-maximalist/src/emcp-stdio.el")'
+
+# Restart presence sync if needed
+emacsclient --eval '(emcp-presence/start-aq-sync)'
+```
+
+## If daemon starts but emcp-stdio.el is not loaded
+
+```bash
+emacsclient --eval '(featurep (quote emcp-stdio))' # should be t
+# If nil:
+emacsclient --eval '(load-file "/path/to/src/emcp-stdio.el")'
+```
+
+## Escalation
+
+If the daemon repeatedly crashes, check `~/.emacs.d/emcs-daemon.log`
+for errors. Common causes: out-of-memory (maximalist mode with 9217
+tools), init.el error on startup.
+#+end_src
+
+** RB-002: Broadcast Stale
+
+#+begin_src markdown :tangle docs/runbooks/broadcast-stale.md
+# RB-002: emcp presence broadcast stale
+
+**Alert**: `emcp-broadcast-stale`
+**Severity**: warning
+**Component**: emcp-presence
+
+## What this means
+
+The `ts` field in the mDNS TXT record has not been updated in >10
+minutes. Either:
+- The aq → mDNS sync timer was cancelled
+- `avahi-publish` crashed
+- The aq NDJSON file has not been written to (aq agents are quiet)
+
+The Remembrance Agent will see the right peers on the network but
+with stale task/worktree context. Conflict detection degrades.
+
+## Diagnosis
+
+```bash
+# Check aq NDJSON freshness
+ls -la ~/.aq/channels/broadcast/presence.ndjson
+tail -1 ~/.aq/channels/broadcast/presence.ndjson | python3 -c \
+  "import json,sys,time; e=json.loads(sys.stdin.read()); \
+   print(f'age: {int(time.time()) - e[\"ts\"]}s')"
+
+# Check mDNS TXT record
+avahi-browse -t -r -p _emcp._tcp | grep "^=" | head -5
+
+# Check if publisher process is running
+ps aux | grep avahi-publish
+```
+
+## Resolution
+
+```bash
+# Restart the aq sync timer from within Emacs
+emacsclient --eval '(emcp-presence/stop-aq-sync)'
+emacsclient --eval '(emcp-presence/start-aq-sync)'
+
+# Or broadcast manually
+emacsclient --eval \
+  '(emcp-presence/broadcast "manual recovery" "emcp" "ops")'
+
+# Verify mDNS TXT updated
+avahi-browse -t -r -p _emcp._tcp | grep ts=
+```
+#+end_src
+
+** RB-003: No Peers
+
+#+begin_src markdown :tangle docs/runbooks/no-peers.md
+# RB-003: No active emcp peers on network
+
+**Alert**: `emcp-no-peers`
+**Severity**: warning
+**Component**: emcp-presence
+
+## What this means
+
+`avahi-browse -t _emcp._tcp` returns no resolved services with
+`ts < 300s`. The Remembrance Agent has no network peers to query.
+It will fall back to local daemon only.
+
+This is expected if working alone. It is unexpected if nexus and
+minibos are both running.
+
+## Diagnosis
+
+```bash
+# Is avahi-daemon running?
+systemctl status avahi-daemon   # Linux
+ps aux | grep avahi             # macOS: Bonjour always on
+
+# Can we browse any mDNS services at all?
+avahi-browse -t -a | head -20   # Linux
+dns-sd -B _services._dns-sd._udp local  # macOS
+
+# Are other hosts reachable?
+ping nexus.local
+ping minibos.local
+
+# Check mDNS firewall
+# UDP 5353 must be open on all hosts
+```
+
+## Resolution
+
+If avahi-daemon is not running (Linux/FreeBSD):
+```bash
+sudo systemctl start avahi-daemon
+```
+
+If on Tailscale and peers are not on same LAN:
+```bash
+# mDNS doesn't cross subnets — use TRAMP directly
+emacsclient --eval \
+  '(emcp-t2/remote-org-headings "nexus.local" "/data/org" nil)'
+```
+
+If peers are running but not broadcasting:
+```bash
+# On each peer: restart presence
+ssh nexus.local emacsclient --eval '(emcp-presence/start-aq-sync)'
+```
+#+end_src
+
+* The AI Angle (for the Meetup)
+
+The Grafana meetup theme is AI in observability.  The emcp system
+inverts the usual relationship: instead of using AI to analyze
+observability data, it uses observability infrastructure to make
+an AI retrieval system reliable.
+
+The five-line version for the lightning talk at the meetup:
+
+1. The Remembrance Agent is a distributed system.  Distributed systems
+   need observability.
+
+2. The most common failure mode — "the RA surfaced nothing" — is
+   ambiguous without metrics.  Was the corpus empty or was the daemon
+   down?
+
+3. OTel → Prometheus → Grafana makes the ambiguity detectable in
+   <60 seconds.
+
+4. The alerts are themselves a runbook for the AI agents: when
+   =emcp-daemon-down= fires, the agent knows not to wait for JITIR
+   retrieval results.
+
+5. The observation from Cast AI's talk: right-size the observability
+   stack for actual usage patterns.  For a personal homelab RA, 5
+   gauges and 4 alerts is right-sized.  Don't instrument the obarray
+   walk.  Instrument the things that fail silently.
+
+#+begin_src mermaid :file docs/diagrams/ai-observability-inversion.png
+graph LR
+    subgraph normal["Normal AI + Observability"]
+        O1[OTel metrics] --> G1[Grafana]
+        G1 --> A1[AI analysis\nof system health]
+    end
+
+    subgraph inverted["emcp: Observability of AI infrastructure"]
+        O2[emcp-otel scrapes\ndaemon, mDNS, aq] --> G2[Grafana alerts]
+        G2 --> R2[Runbooks]
+        R2 --> A2[AI agent knows\nsystem state is reliable]
+        A2 --> E2[emcp-data-eval\nRA queries]
+        E2 -->|success| A2
+        G2 -.->|alert fires| A2
+        A2 -.->|degrade gracefully| A2
+    end
+#+end_src
+
+The punchline for the room: if your AI system depends on infrastructure
+that can fail silently, you need to observe the infrastructure, not
+just the AI.  The Remembrance Agent is only as good as its ability to
+say "I have nothing to surface" vs "I am broken and pretending."  Those
+are different situations requiring different responses.
+
+* Conjectures (C-G series — observability)
+
+| ID | Claim | Status |
+|-------+-------+--------|
+| C-G001 | The 5-gauge + 4-alert set catches all 8 silent failure modes listed in Section 2 | open |
+| C-G002 | emcp_daemon_up drops to 0 within 30 seconds of daemon exit | open |
+| C-G003 | emcp_presence_last_broadcast_age_seconds is accurate within ±5s of actual aq file mtime | open |
+| C-G004 | The OTel bridge adds <50ms overhead to the 15s scrape cycle | open |
+| C-G005 | Grafana alert evaluation latency is <60s from failure to notification on the homelab stack | open |
+| C-G006 | Runbook RB-001 resolves a daemon-down condition in <5 minutes without context switching | open |

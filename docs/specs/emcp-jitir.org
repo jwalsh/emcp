@@ -1,0 +1,560 @@
+#+title: emcp-jitir — Emacs Daemon as Personal Retrieval Layer
+#+subtitle: When you don't know what you know: eval as query language over the living document graph
+#+author: jwalsh
+#+date: 2026-03-19
+#+property: header-args :mkdirp t
+#+property: header-args:emacs-lisp :lexical t :tangle yes
+#+property: header-args:python :tangle yes
+#+property: header-args:mermaid :file docs/diagrams/
+#+options: toc:3 num:t
+
+* Relationship to emacs-mcp-maximalist
+
+This is a *secondary spec* scoped to one use case of the emcp daemon
+data-layer tools.  It does not replace =emacs-mcp-maximalist/spec.org=.
+
+The parent project's axiom — the MCP server does not know what Emacs can
+do, Emacs tells it — applies here in a second register: the agent does not
+know what /you/ know, and neither do you with certainty.  The daemon is
+the retrieval surface.
+
+#+begin_quote
+The agent cannot know what you know. Your org files know. Eval is the
+query language.
+#+end_quote
+
+* The Problem JITIR Is Solving Here
+
+JITIR (Just-In-Time Information Retrieval) in the parent project is
+defined as: retrieve the right information at the right moment without
+requiring the user to know they need it.
+
+The standard implementation paths are:
+
+- *Indexed keyword search*: you must already know the term
+- *Embedding distance search*: semantic proximity, but flattens structure
+  and loses temporal/relational context
+
+Both assume a static corpus with known schema.  Neither handles:
+
+1. *You don't know the term* — the concept lives in your notes as a
+   paraphrase, a date, a tag, a TODO state transition, a clock entry, a
+   cross-reference via =org-id=
+2. *The structure is the data* — an org heading's level, its parent, its
+   SCHEDULED date, its LOGBOOK entries, its =:PROPERTIES:= drawer, and
+   its body text are all first-class retrieval axes that embedding search
+   treats as noise
+3. *The working set matters* — the document you have open with unsaved
+   edits is not in any index
+4. *Eval can compose* — =(org-map-entries f MATCH SCOPE)= crosses file
+   boundaries, follows =org-id= links, filters by arbitrary predicates,
+   and returns structured data in one call
+
+The Emacs daemon is the only retrieval layer with all four properties
+simultaneously, because it holds the parse tree and the eval runtime in
+the same process.
+
+* Daemon States and Retrieval Capability
+
+The value of the emcp layer varies significantly depending on the daemon's
+state.  These are not binary — they form a capability gradient.
+
+#+begin_src mermaid :file docs/diagrams/daemon-states.png
+stateDiagram-v2
+    [*] --> Cold: emacs --batch -Q (no daemon)
+    Cold --> Warm: emacs --daemon (vanilla)
+    Warm --> Loaded: user init.el evaluated
+    Loaded --> Hot: agenda files cached, org-id index built
+    Hot --> Live: active clocks, unsaved buffers, in-flight captures
+
+    note right of Cold
+        779 pure function tools only
+        no data-layer tools
+        equivalent to filesystem MCP
+    end note
+
+    note right of Warm
+        9 data-layer tools available
+        no org index, no user packages
+        emcp-data-eval works
+    end note
+
+    note right of Loaded
+        org-agenda, org-id, org-roam available
+        file associations known
+        custom search functions accessible
+    end note
+
+    note right of Hot
+        org-id-locations populated
+        agenda cache warm
+        cross-file queries fast
+    end note
+
+    note right of Live
+        in-memory state unreachable by any other means
+        unsaved captures, active clocks
+        highest retrieval fidelity
+    end note
+#+end_src
+
+Conjecture C-D001 below: retrieval quality degrades gracefully across
+states, not catastrophically.  A Cold daemon is still useful for
+=emcp-data-find-file= followed by =emcp-data-eval= against the loaded
+buffer.  A Hot daemon enables queries that no other retrieval system can
+answer.
+
+* Retrieval Modes
+
+** Mode 1: ReadFile / GrepTool equivalents
+
+The primitives the codebase inspection model uses.  These are the honest
+tool calls — the model cannot guess the result from training data.
+
+| emcp tool | ReadFileTool/GrepTool analogue | Returns |
+|------------------------------+--------------------------------+----------------------------------|
+| =emcp-data-find-file= | OpenFile | buffer name, confirms file loaded |
+| =emcp-data-buffer-read= | ReadFile | full buffer text, including unsaved edits |
+| =emcp-data-eval= with =grep-regexp= | GrepTool | matching lines with context |
+| =emcp-data-org-headings= | NavigateTool | structured heading tree |
+
+These are the floor.  A filesystem MCP could approximate them for saved
+files.  The daemon adds: unsaved edits, already-open files, buffer state.
+
+** Mode 2: Structural queries (parse-tree navigation)
+
+Things keyword search and embedding search cannot do:
+
+#+begin_src emacs-lisp :tangle src/emcp-query-library.el
+;;; emcp-query-library.el — reusable eval expressions for structural retrieval
+;;; These are composed and passed to emcp-data-eval by the agent.
+;;; Each returns a serializable value (string, list, alist).
+
+(defun emcp-q/todos-by-tag (tag)
+  "Return all TODO headings tagged TAG across agenda files."
+  (require 'org-agenda)
+  (let (results)
+    (org-map-entries
+     (lambda ()
+       (push (list :heading (org-get-heading t t t t)
+                   :file    (buffer-file-name)
+                   :state   (org-get-todo-state)
+                   :tags    (org-get-tags))
+             results))
+     (format "+%s+TODO=\"TODO\"" tag)
+     'agenda)
+    (nreverse results)))
+
+(defun emcp-q/recently-clocked (n-days)
+  "Return headings with clock entries in the last N-DAYS days."
+  (require 'org-clock)
+  (let ((cutoff (- (float-time) (* n-days 86400)))
+        results)
+    (org-map-entries
+     (lambda ()
+       (let ((clocks (org-clock-get-clocked-time)))
+         (when (> clocks 0)
+           (push (list :heading (org-get-heading t t t t)
+                       :file    (buffer-file-name)
+                       :minutes clocks)
+                 results))))
+     nil 'agenda)
+    (seq-filter
+     (lambda (e) (plist-get e :minutes))
+     (nreverse results))))
+
+(defun emcp-q/orphaned-nodes ()
+  "Return org-id nodes with no incoming links (dead ends in the graph)."
+  (require 'org-id)
+  (org-id-update-id-locations)
+  (let* ((all-ids (hash-table-keys org-id-locations))
+         (linked  (let (acc)
+                    (org-map-entries
+                     (lambda ()
+                       (let ((links (org-element-map
+                                        (org-element-at-point) 'link
+                                      (lambda (l)
+                                        (when (string= (org-element-property :type l) "id")
+                                          (org-element-property :path l))))))
+                         (setq acc (append acc links))))
+                     nil 'agenda)
+                    acc)))
+    (seq-filter (lambda (id) (not (member id linked))) all-ids)))
+
+(defun emcp-q/context-at-point (file line)
+  "Return heading hierarchy + body text at FILE:LINE."
+  (with-current-buffer (find-file-noselect file)
+    (goto-char (point-min))
+    (forward-line (1- line))
+    (list :breadcrumb (org-get-outline-path t)
+          :heading    (org-get-heading t t t t)
+          :body       (org-get-entry)
+          :state      (org-get-todo-state)
+          :scheduled  (org-entry-get nil "SCHEDULED")
+          :deadline   (org-entry-get nil "DEADLINE")
+          :tags       (org-get-tags)
+          :properties (org-entry-properties nil 'standard))))
+#+end_src
+
+** Mode 3: Relational traversal (org-id graph)
+
+org-id links form a graph that neither embedding search nor grep can
+traverse in a single call.  The daemon holds the index in memory.
+
+#+begin_src emacs-lisp :tangle src/emcp-query-library.el
+(defun emcp-q/follow-id-link (id)
+  "Return the heading and body text for org-id ID."
+  (require 'org-id)
+  (let ((loc (org-id-find id t)))
+    (when loc
+      (with-current-buffer (find-file-noselect (car loc))
+        (goto-char (cdr loc))
+        (list :id       id
+              :heading  (org-get-heading t t t t)
+              :file     (buffer-file-name)
+              :body     (org-get-entry)
+              :links-to (org-element-map
+                            (org-element-parse-buffer) 'link
+                          (lambda (l)
+                            (when (string= (org-element-property :type l) "id")
+                              (org-element-property :path l)))))))))
+
+(defun emcp-q/ego-graph (id depth)
+  "Return the subgraph of org-id links within DEPTH hops of ID."
+  (require 'org-id)
+  (let ((visited (make-hash-table :test 'equal))
+        result)
+    (cl-labels ((traverse (current d)
+                  (unless (or (gethash current visited) (< d 0))
+                    (puthash current t visited)
+                    (let ((node (emcp-q/follow-id-link current)))
+                      (when node
+                        (push node result)
+                        (dolist (child (plist-get node :links-to))
+                          (traverse child (1- d))))))))
+      (traverse id depth))
+    (nreverse result)))
+#+end_src
+
+** Mode 4: Temporal queries (what you were thinking about)
+
+Neither indexed search nor embedding search has a sensible answer to
+"what was I working on last Thursday at 3pm."  The org clock and
+capture timestamps give the daemon a temporal dimension.
+
+#+begin_src emacs-lisp :tangle src/emcp-query-library.el
+(defun emcp-q/what-was-i-doing (time-string)
+  "Return clocked heading at TIME-STRING (org-time-string or ISO 8601)."
+  (require 'org-clock)
+  (let ((target (org-time-string-to-time time-string))
+        result)
+    (org-map-entries
+     (lambda ()
+       (org-element-map (org-element-at-point) 'clock
+         (lambda (c)
+           (let* ((val   (org-element-property :value c))
+                  (start (org-element-property :year-start val))
+                  (end   (org-element-property :year-end val)))
+             (when (and start end
+                        (time-less-p
+                         (encode-time 0
+                           (org-element-property :minute-start val)
+                           (org-element-property :hour-start val)
+                           (org-element-property :day-start val)
+                           (org-element-property :month-start val)
+                           start)
+                         target)
+                        (time-less-p
+                         target
+                         (encode-time 0
+                           (org-element-property :minute-end val)
+                           (org-element-property :hour-end val)
+                           (org-element-property :day-end val)
+                           (org-element-property :month-end val)
+                           end)))
+               (setq result
+                     (list :heading  (org-get-heading t t t t)
+                           :file     (buffer-file-name)
+                           :outline  (org-get-outline-path t))))))))
+     nil 'agenda)
+    result))
+#+end_src
+
+* The "Don't Know What You Know" Problem
+
+The JITIR framing assumes the agent retrieves things the user needs but
+hasn't explicitly requested.  Emcp enables a harder variant: the user
+may have recorded something they no longer remember recording.
+
+Standard retrieval fails here because:
+- keyword search requires you to remember the term you used
+- embedding search requires semantic proximity to the query
+- neither can follow the trail from a TODO state transition to the
+  meeting notes that precipitated it, to the org-id link to the project
+  specification
+
+The eval surface composes these traversals.  A single =emcp-data-eval=
+call can:
+
+1. find all headings with a specific tag
+2. follow org-id links in their bodies
+3. filter by LOGBOOK state transitions in the last N days
+4. return the breadcrumb path to each result
+
+This is a join across three "tables" (headings, links, state history) in
+one round trip.  The daemon holds all three in memory.
+
+#+begin_src mermaid :file docs/diagrams/retrieval-comparison.png
+graph LR
+    subgraph q["Query: what did I decide about auth in Q1?"]
+    end
+
+    subgraph kw["Keyword search"]
+        K1[grep 'auth']
+        K2[grep 'decision']
+        K3[manually intersect]
+        K1 --> K3
+        K2 --> K3
+    end
+
+    subgraph em["Embedding search"]
+        E1[embed query]
+        E2[cosine similarity]
+        E3[top-k results]
+        E1 --> E2 --> E3
+        E3 -.->|misses: structured\nmetadata, links| E3
+    end
+
+    subgraph emcp["emcp-data-eval"]
+        D1["org-map-entries\n+auth+DECISION"]
+        D2["follow org-id links\nin matched bodies"]
+        D3["filter by\nQ1 date range"]
+        D4["return breadcrumb\n+ body + properties"]
+        D1 --> D2 --> D3 --> D4
+    end
+
+    q --> kw
+    q --> em
+    q --> emcp
+#+end_src
+
+* Conjectures (C-D series)
+
+These are falsifiable.  They extend the parent project's C-series
+(C-001 through C-011) with daemon-as-retrieval-layer concerns.
+
+| ID    | Claim | Status |
+|-------+-------+--------|
+| C-D001 | Retrieval quality degrades gracefully across daemon states (Cold → Live) | open |
+| C-D002 | =emcp-data-eval= with =org-map-entries= outperforms sqlite-vec embedding search for tag+state queries | open |
+| C-D003 | org-id graph traversal via eval has lower latency than reconstructing the graph from file parse in JITIR | open |
+| C-D004 | Temporal queries (clock-based) are unanswerable by any retrieval system that doesn't hold org parse state | open |
+| C-D005 | The agent, given emcp eval access, can reconstruct a project context it has never seen without a summary document | open |
+| C-D006 | Eval composition (multi-step join in one call) reduces total tool calls vs ReadFile+GrepTool primitives by ≥50% | open |
+| C-D007 | A Cold daemon + emcp-data-find-file + emcp-data-eval is sufficient for all Mode 1 (ReadFile/GrepTool) use cases | open |
+| C-D008 | Unsaved buffer content (Mode 1 delta over filesystem MCP) changes agent output in ≥10% of capture-heavy sessions | open |
+
+** Measurement Protocol for C-D002
+
+The comparison point is JITIR as designed in the parent project:
+=sqlite-vec= + =nomic-embed-text= on nexus with local embedding.
+
+#+begin_src python :tangle src/measure_cd002.py
+"""measure_cd002.py — compare emcp eval vs sqlite-vec for structured queries.
+
+Probe C-D002: does org-map-entries beat embedding distance for
+tag+state queries on personal org files?
+
+Metrics:
+  precision@5  — relevant results in top 5
+  recall       — fraction of known relevant results found
+  latency_ms   — wall clock per query
+
+Run:
+  python src/measure_cd002.py --queries queries-cd002.json
+"""
+
+import asyncio
+import json
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+from emcp_client import EmcpClient
+
+
+@dataclass
+class QueryResult:
+    query_id: str
+    method:   str
+    results:  list[dict]
+    latency_ms: float
+    precision_at_5: float | None = None
+    recall: float | None = None
+
+
+EVAL_QUERIES = {
+    "tag_state_01": '(emcp-q/todos-by-tag "auth")',
+    "temporal_01":  '(emcp-q/what-was-i-doing "2026-01-15 15:00")',
+    "orphan_01":    '(emcp-q/orphaned-nodes)',
+    "ego_01":       '(emcp-q/ego-graph (car (hash-table-keys org-id-locations)) 2)',
+}
+
+
+async def run_emcp_queries(queries: dict[str, str]) -> list[QueryResult]:
+    results = []
+    async with EmcpClient() as emcp:
+        for qid, sexp in queries.items():
+            t0 = time.monotonic()
+            raw = await emcp.call_tool("emcp-data-eval", {"args": [sexp]})
+            ms  = (time.monotonic() - t0) * 1000
+            results.append(QueryResult(
+                query_id=qid, method="emcp-eval",
+                results=[{"raw": raw}], latency_ms=ms,
+            ))
+    return results
+
+
+def report(results: list[QueryResult]) -> None:
+    print(f"\n{'ID':<20} {'Method':<12} {'Latency ms':>10}")
+    print("-" * 46)
+    for r in results:
+        print(f"{r.query_id:<20} {r.method:<12} {r.latency_ms:>10.1f}")
+
+
+if __name__ == "__main__":
+    results = asyncio.run(run_emcp_queries(EVAL_QUERIES))
+    report(results)
+#+end_src
+
+* Integration with JITIR Architecture
+
+JITIR as designed uses =sqlite-vec= for embedding storage with nexus as
+a dumb index server and clients embedding locally.  The emcp layer sits
+alongside this, not replacing it.
+
+#+begin_src mermaid :file docs/diagrams/jitir-emcp-integration.png
+graph TD
+    subgraph agent["Agent (Claude Code)"]
+        Q[query intent]
+    end
+
+    subgraph routing["Retrieval routing"]
+        R1{known term\nor exact match?}
+        R2{structural /\ntemporal?}
+        R3{semantic\nproximity?}
+    end
+
+    subgraph emcp["emcp daemon layer"]
+        E1[emcp-data-eval\norg-map-entries]
+        E2[emcp-data-org-headings\nstructure nav]
+        E3[emcp-data-buffer-read\nworking set]
+    end
+
+    subgraph jitir["JITIR sqlite-vec layer"]
+        J1[nomic-embed-text\nlocal embedding]
+        J2[sqlite-vec\ncosine search]
+    end
+
+    subgraph fs["Filesystem MCP\n(fallback)"]
+        F1[ReadFile]
+        F2[GrepTool]
+    end
+
+    Q --> R1
+    R1 -->|yes| F2
+    R1 -->|no| R2
+    R2 -->|yes| E1
+    R2 -->|yes| E2
+    R2 -->|working set| E3
+    R2 -->|no| R3
+    R3 -->|yes| J1 --> J2
+    R3 -->|no| F1
+#+end_src
+
+The routing heuristic (C-D002 and C-D003 together): structural and
+temporal queries go to emcp; semantic proximity queries go to
+sqlite-vec; exact match goes to grep.  The daemon and the index are
+complementary, not competitors.
+
+The case where both are needed: "find notes semantically similar to
+this concept, then follow org-id links from the matches to related
+decisions."  sqlite-vec handles the first hop, emcp handles the
+traversal.  Neither alone answers the question.
+
+* Failure Modes
+
+** The eval footgun
+
+=emcp-data-eval= is =eval=.  Unlike the 779 pure string tools, a
+mistaken or malicious call can:
+
+- delete files (=delete-file=)
+- run shell commands (=shell-command=)
+- modify org state irreversibly (=org-todo=, =org-set-property=)
+
+The parent project's Bastille jail design (=bastille-claude-sandbox=)
+is the right containment layer for untrusted agents.  For trusted
+personal use on minibos/nexus the risk surface is: the agent does
+something you asked it to do but phrased imprecisely.
+
+Mitigation: read-only query functions (C series above) should live in
+a dedicated library loaded into the daemon.  The agent is given the
+library function names, not raw eval.  =emcp-data-eval= remains
+available but the prompt steers toward the library surface.
+
+** The stale index problem
+
+C-D003 assumes the org-id index is warm.  A freshly started daemon on
+a large org corpus (500+ files) will spend the first query building
+=org-id-locations=.  This is a one-time cost per session but it can be
+seconds.  Measurement belongs in C-D003's instrumentation.
+
+** The unsaved edit cliff
+
+C-D008 probes whether unsaved buffer content materially changes
+retrieval.  The failure mode is the opposite: the agent reads a buffer
+mid-edit and acts on a transient state the user didn't intend to
+commit.  The capture workflow (=org-capture= template incomplete) is
+the canonical case.
+
+* Daemon States × Query Modes Matrix
+
+#+begin_src emacs-lisp :tangle no
+;; Capability matrix — for CONJECTURES.md documentation
+;; (cold warm loaded hot live) × (readfile grep structural relational temporal working-set)
+
+;; cold    | Y Y N N N N
+;; warm    | Y Y Y N N Y  (emcp-data-eval works; no org index)
+;; loaded  | Y Y Y Y N Y
+;; hot     | Y Y Y Y Y Y
+;; live    | Y Y Y Y Y Y  (+ unsaved edits)
+#+end_src
+
+The Hot→Live delta (C-D008) is the uniquely unassailable case: no
+other retrieval system has it.  A filesystem MCP reads saved files.
+sqlite-vec indexes committed content.  The Emacs daemon holds the
+document you're editing right now.
+
+* Open Design Questions
+
+These are not conjectures because they're architectural choices, not
+falsifiable predictions.  Record the decision and rationale when made.
+
+1. *Library vs raw eval*: Should the agent be given =emcp-q/*= function
+   names plus raw =emcp-data-eval=, or only the library surface?
+   Tradeoff: composability vs attack surface.
+
+2. *Index warming*: Should the emcp server emit a startup notification
+   when the org-id index is ready, or should the client probe with a
+   cheap query?
+
+3. *Structured return vs string*: =emcp-data-eval= returns a string
+   (=prin1-to-string= of the result).  The agent has to parse this.
+   Should the daemon tools return JSON directly for list/alist results?
+   Cost: complexity in =emcp-stdio.el=.  Benefit: cleaner tool results.
+
+4. *JITIR routing*: Should routing (emcp vs sqlite-vec vs grep) live
+   in the agent prompt, in a routing MCP tool, or in =aq= (the gossip
+   layer)?  The =aq= framing is interesting: broadcast "I need context
+   about auth decisions" and let whichever layer responds first win.

@@ -1,0 +1,679 @@
+#+title: emcp-presence — Agent Presence and Service Discovery via mDNS
+#+subtitle: aq gossip semantics wrapped into emcp tools using avahi/nss-mdns
+#+author: jwalsh
+#+date: 2026-03-19
+#+property: header-args :mkdirp t
+#+property: header-args:emacs-lisp :lexical t :tangle yes
+#+property: header-args:python :tangle yes
+#+property: header-args:mermaid :file docs/diagrams/
+#+options: toc:3 num:t
+
+* Relationship to Sibling Specs
+
+This is the fourth file in the emcp spec family:
+
+| File | Scope |
+|------+-------|
+| =emacs-mcp-maximalist/spec.org= | Protocol, obarray, 779 tools |
+| =emcp-jitir.org= | Retrieval use cases, C-D conjectures |
+| =emcp-data-eval.org= | Eval contract, trust tiers, system barrier |
+| =emcp-presence.org= | *This file* — discovery, presence, aq integration |
+
+The dependency direction: emcp-presence builds on emcp-data-eval's
+trust tier model and routes queries through it.  It does not require
+emcp-jitir but is its primary trigger.
+
+* The Problem
+
+=aq= broadcasts agent presence as TTL-keyed NDJSON over a shared file.
+It answers: "what is being worked on right now, across worktrees."
+
+The Remembrance Agent surfaces related history.  It answers: "what did
+we ever know about what we are working on right now."
+
+Neither has a discovery mechanism.  You must know the file path for aq.
+You must know the daemon address for emcp.  On a local network with
+Tailscale and hostnames like =nexus.local=, =hydra.local=, =minibos.local=,
+this is friction that mDNS eliminates.
+
+The proposal: use =_emcp._tcp= mDNS service records to carry both daemon
+address *and* current agent presence state — collapsing aq-style gossip
+and service discovery into a single protocol layer.  Then expose this as
+four emcp MCP tools that any agent can call.
+
+#+begin_quote
+mDNS TXT records are key-value pairs with ~250 byte values.
+They are exactly the right size for aq presence metadata.
+They are already the right transport for "who is on this network."
+#+end_quote
+
+* What nss-mdns Gives You
+
+With =nss-mdns= configured in =/etc/nsswitch.conf=:
+
+#+begin_src conf :tangle no
+hosts: mymachines mdns4_minimal [NOTFOUND=return] resolve [!UNAVAIL=return] files myhostname dns
+#+end_src
+
+The following just work, with zero configuration, on any machine on the
+same L2 or Tailscale network:
+
+#+begin_src shell :tangle no
+ssh nexus.local                                    # resolves via mDNS
+emacsclient --socket-name /tmp/emacs$(id -u)/server \
+  --server-file nexus.local                        # remote daemon
+#+end_src
+
+#+begin_src emacs-lisp :tangle no
+(find-file-noselect "/ssh:nexus.local:/data/org/sprint-axiom.org")  ; TRAMP
+#+end_src
+
+The =.local= suffix is the nss-mdns domain.  Avahi publishes it.
+Anything on the network resolves it.  No DNS server, no =/etc/hosts=,
+no Tailscale magic DNS required (though Tailscale works too).
+
+* Service Record Design
+
+** The =_emcp._tcp= service type
+
+#+begin_src xml :tangle etc/avahi/services/emcp.service
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<service-group>
+  <name replace-wildcards="yes">emcp@%h</name>
+  <service>
+    <type>_emcp._tcp</type>
+    <!-- port 0: stdio transport only, not TCP socket -->
+    <!-- actual contact is via emacsclient or SSH     -->
+    <port>0</port>
+    <txt-record>v=0.1</txt-record>
+    <txt-record>host=%h</txt-record>
+    <txt-record>user=jwalsh</txt-record>
+    <txt-record>org-root=/data/org</txt-record>
+    <txt-record>tier=2</txt-record>
+    <!-- aq presence fields — updated dynamically -->
+    <txt-record>task=</txt-record>
+    <txt-record>worktree=</txt-record>
+    <txt-record>agent=</txt-record>
+    <txt-record>ts=0</txt-record>
+  </service>
+</service-group>
+#+end_src
+
+The =task=, =worktree=, =agent=, and =ts= fields are the aq presence
+payload.  They are empty at static registration time and updated
+dynamically when an agent broadcasts presence (see Section 5).
+
+** Why port 0?
+
+The emcp server is stdio, not a TCP socket.  Port 0 signals to any
+client that the contact mechanism is =emacsclient= via SSH, not a direct
+TCP connection.  The host field in the TXT record is the SSH hostname.
+A client that discovers =_emcp._tcp= with =port=0= knows to use:
+
+#+begin_src shell :tangle no
+ssh <host>.local emacsclient --eval '<sexp>'
+#+end_src
+
+A future TCP transport could use a real port.  The record format
+accommodates it without breaking existing clients.
+
+** TXT record size budget
+
+Avahi TXT records have a 255-byte limit per field, 1300 bytes total.
+The presence payload must fit:
+
+| Field | Max bytes | Example |
+|-------+-----------+---------|
+| =v= | 4 | =0.1= |
+| =host= | 32 | =minibos= |
+| =user= | 32 | =jwalsh= |
+| =org-root= | 64 | =/data/org= |
+| =tier= | 2 | =2= |
+| =task= | 120 | =implementing C-E009 allowlist= |
+| =worktree= | 64 | =emacs-mcp-maximalist= |
+| =agent= | 32 | =claude-code-7f3a= |
+| =ts= | 12 | =1742385600= |
+| *total* | *~362* | well within 1300 |
+
+* The Four MCP Tools
+
+=emcp-presence= exposes exactly four tools via =emcp-stdio.el=.
+No eval surface.  No org corpus access.  Pure network metadata.
+
+** Tool 1: =emcp-presence-discover=
+
+Scan the local network for all =_emcp._tcp= services and return their
+metadata.
+
+#+begin_src emacs-lisp :tangle src/emcp-presence.el
+;;; emcp-presence.el — mDNS presence discovery and broadcast for emcp
+;;; Exposes 4 MCP tools: discover, broadcast, peers, query
+
+(require 'json)
+
+(defvar emcp-presence/service-type "_emcp._tcp"
+  "mDNS service type for emcp daemon advertisement.")
+
+(defvar emcp-presence/avahi-browse-timeout 2
+  "Seconds to wait for avahi-browse results.")
+
+(defun emcp-presence/discover ()
+  "Return all emcp peers on the local network as a list of plists.
+Calls avahi-browse and parses the -p (parseable) output.
+Each result has: :host :address :org-root :tier :task :worktree :agent :ts"
+  (unless (executable-find "avahi-browse")
+    (error "emcp-presence: avahi-browse not found — install avahi-utils"))
+  (let* ((raw (shell-command-to-string
+               (format "avahi-browse -t -r -p %s 2>/dev/null"
+                       emcp-presence/service-type)))
+         (lines (seq-filter (lambda (l) (string-prefix-p "=" l))
+                            (split-string raw "\n" t))))
+    (mapcar #'emcp-presence--parse-avahi-line lines)))
+
+(defun emcp-presence--parse-avahi-line (line)
+  "Parse a resolved avahi-browse -p line into a plist.
+Format: =;iface;proto;name;type;domain;host;addr;port;txt..."
+  (let* ((parts   (split-string line ";" nil))
+         (host    (nth 6  parts))
+         (address (nth 7  parts))
+         (txt-raw (mapconcat #'identity (nthcdr 9 parts) ";"))
+         (txt     (emcp-presence--parse-txt txt-raw)))
+    (list :host      (string-remove-suffix "." host)
+          :address   address
+          :org-root  (alist-get "org-root" txt "" nil #'string=)
+          :tier      (string-to-number
+                      (alist-get "tier" txt "0" nil #'string=))
+          :task      (alist-get "task"     txt "" nil #'string=)
+          :worktree  (alist-get "worktree" txt "" nil #'string=)
+          :agent     (alist-get "agent"    txt "" nil #'string=)
+          :ts        (string-to-number
+                      (alist-get "ts" txt "0" nil #'string=)))))
+
+(defun emcp-presence--parse-txt (txt-string)
+  "Parse avahi TXT record string into an alist of (key . value) pairs."
+  (mapcar (lambda (pair)
+            (let ((idx (string-search "=" pair)))
+              (if idx
+                  (cons (substring pair 0 idx)
+                        (substring pair (1+ idx)))
+                (cons pair ""))))
+          (split-string (string-trim txt-string "\"" "\"") "\" \"" t)))
+#+end_src
+
+** Tool 2: =emcp-presence-broadcast=
+
+Update this node's mDNS TXT record with current aq presence state.
+This is how aq semantics enter the mDNS layer.
+
+#+begin_src emacs-lisp :tangle src/emcp-presence.el
+(defun emcp-presence/broadcast (task worktree agent)
+  "Update this node's mDNS TXT record with current presence.
+TASK is a short string describing current work.
+WORKTREE is the git worktree or project name.
+AGENT is the agent identifier (e.g. claude-code session hash).
+Returns :ok or :error with reason."
+  (unless (executable-find "avahi-publish")
+    (error "emcp-presence: avahi-publish not found"))
+  (let* ((ts    (number-to-string (floor (float-time))))
+         (user  (user-login-name))
+         (host  (system-name))
+         (root  (or (bound-and-true-p emcp-t5/shared-root) "/data/org"))
+         (tier  "2")
+         (args  (list "avahi-publish" "-s"
+                      (format "emcp@%s" host)
+                      emcp-presence/service-type
+                      "0"          ; port 0 = stdio
+                      (format "v=0.1")
+                      (format "host=%s" host)
+                      (format "user=%s" user)
+                      (format "org-root=%s" root)
+                      (format "tier=%s" tier)
+                      (format "task=%s" (substring task 0 (min 120 (length task))))
+                      (format "worktree=%s" (substring worktree 0 (min 64 (length worktree))))
+                      (format "agent=%s" (substring agent 0 (min 32 (length agent))))
+                      (format "ts=%s" ts))))
+    ;; avahi-publish runs in background; kill old instance first
+    (emcp-presence--kill-publisher)
+    (let ((proc (apply #'start-process "emcp-presence-pub" nil args)))
+      (setq emcp-presence/publisher-proc proc)
+      (list :status :ok :host host :ts ts))))
+
+(defvar emcp-presence/publisher-proc nil
+  "The running avahi-publish process, if any.")
+
+(defun emcp-presence--kill-publisher ()
+  "Kill any existing avahi-publish process for this daemon."
+  (when (and emcp-presence/publisher-proc
+             (process-live-p emcp-presence/publisher-proc))
+    (delete-process emcp-presence/publisher-proc)
+    (setq emcp-presence/publisher-proc nil)))
+
+(defun emcp-presence/broadcast-from-aq (aq-ndjson-file)
+  "Read the most recent aq presence entry and broadcast via mDNS.
+AQ-NDJSON-FILE is the path to the aq presence NDJSON file.
+This is the bridge between aq and emcp-presence."
+  (when (file-exists-p aq-ndjson-file)
+    (with-temp-buffer
+      (insert-file-contents aq-ndjson-file)
+      (goto-char (point-max))
+      ;; find last non-empty line
+      (while (and (not (bobp))
+                  (string-blank-p (thing-at-point 'line)))
+        (forward-line -1))
+      (let* ((line (thing-at-point 'line t))
+             (entry (condition-case nil
+                        (json-parse-string (string-trim line)
+                                           :object-type 'plist)
+                      (error nil))))
+        (when entry
+          (emcp-presence/broadcast
+           (or (plist-get entry :task) "")
+           (or (plist-get entry :worktree) "")
+           (or (plist-get entry :agent) "")))))))
+#+end_src
+
+** Tool 3: =emcp-presence-peers=
+
+Return current network state: who is present, what are they working on,
+and how stale is the data.
+
+#+begin_src emacs-lisp :tangle src/emcp-presence.el
+(defun emcp-presence/peers ()
+  "Return current peer list with presence freshness.
+Filters out stale entries (ts older than 5 minutes).
+Returns list of plists with :host :task :worktree :age-seconds :fresh-p"
+  (let* ((now   (floor (float-time)))
+         (peers (emcp-presence/discover))
+         (ttl   300))  ; 5 minutes = stale threshold
+    (mapcar (lambda (peer)
+              (let* ((ts    (plist-get peer :ts))
+                     (age   (- now ts))
+                     (fresh (< age ttl)))
+                (list :host       (plist-get peer :host)
+                      :address    (plist-get peer :address)
+                      :task       (plist-get peer :task)
+                      :worktree   (plist-get peer :worktree)
+                      :agent      (plist-get peer :agent)
+                      :org-root   (plist-get peer :org-root)
+                      :tier       (plist-get peer :tier)
+                      :age-secs   age
+                      :fresh-p    fresh)))
+            peers)))
+
+(defun emcp-presence/network-summary ()
+  "Return a human-readable summary of current network presence.
+Suitable for Remembrance Agent context injection."
+  (let* ((peers  (emcp-presence/peers))
+         (fresh  (seq-filter (lambda (p) (plist-get p :fresh-p)) peers))
+         (stale  (seq-filter (lambda (p) (not (plist-get p :fresh-p))) peers)))
+    (list :active-count  (length fresh)
+          :stale-count   (length stale)
+          :active-peers  (mapcar (lambda (p)
+                                   (list :host     (plist-get p :host)
+                                         :task     (plist-get p :task)
+                                         :worktree (plist-get p :worktree)))
+                                 fresh)
+          :topics        (delete-dups
+                          (seq-filter #'identity
+                                      (mapcar (lambda (p) (plist-get p :worktree))
+                                              fresh))))))
+#+end_src
+
+** Tool 4: =emcp-presence-query=
+
+Call =emcp-data-eval= on a specific peer discovered via mDNS.
+This is the bridge from presence to retrieval — once you know a peer
+exists and what they're working on, you can query their knowledge graph.
+
+#+begin_src emacs-lisp :tangle src/emcp-presence.el
+(defun emcp-presence/query-peer (hostname sexp-string)
+  "Eval SEXP-STRING on the emcp daemon at HOSTNAME.local.
+HOSTNAME must appear in emcp-presence/discover results.
+Enforces Tier 3 barrier: read-only, no personal paths."
+  (let* ((peers  (emcp-presence/discover))
+         (target (seq-find (lambda (p)
+                             (or (string= (plist-get p :host) hostname)
+                                 (string= (plist-get p :host)
+                                          (concat hostname ".local"))))
+                           peers)))
+    (unless target
+      (error "emcp-presence: %s not found on network" hostname))
+    ;; Enforce Tier 3 barrier before eval
+    (unless (and (fboundp 'emcp-barrier/safe-p)
+                 (emcp-barrier/safe-p sexp-string 3))
+      (error "emcp-presence: sexp rejected by Tier 3 barrier: %s"
+             sexp-string))
+    ;; Route: prefer emacsclient if remote daemon advertises one,
+    ;; fall back to TRAMP + local eval
+    (let ((host (plist-get target :host)))
+      (condition-case err
+          (string-trim
+           (shell-command-to-string
+            (format "ssh %s.local emacsclient --eval %s 2>/dev/null"
+                    host
+                    (shell-quote-argument sexp-string))))
+        (error
+         ;; TRAMP fallback
+         (let ((org-root (plist-get target :org-root)))
+           (with-temp-buffer
+             (insert-file-contents
+              (format "/ssh:%s.local:%s" host org-root))
+             (eval (read sexp-string)))))))))
+#+end_src
+
+* Integrating with aq
+
+The presence broadcast and aq NDJSON are the same data in two formats.
+The bridge is =emcp-presence/broadcast-from-aq=, but the full
+integration runs as a timer:
+
+#+begin_src emacs-lisp :tangle src/emcp-presence.el
+(defvar emcp-presence/aq-sync-timer nil
+  "Timer that syncs aq NDJSON to mDNS presence every 30 seconds.")
+
+(defvar emcp-presence/aq-file nil
+  "Path to the aq presence NDJSON file.  Set this to your aq file.")
+
+(defun emcp-presence/start-aq-sync (&optional aq-file interval)
+  "Start syncing aq NDJSON presence to mDNS every INTERVAL seconds.
+AQ-FILE defaults to emcp-presence/aq-file.
+INTERVAL defaults to 30."
+  (let ((file     (or aq-file emcp-presence/aq-file))
+        (interval (or interval 30)))
+    (unless file
+      (error "emcp-presence: set emcp-presence/aq-file before starting sync"))
+    (when emcp-presence/aq-sync-timer
+      (cancel-timer emcp-presence/aq-sync-timer))
+    (setq emcp-presence/aq-sync-timer
+          (run-at-time nil interval
+                       #'emcp-presence/broadcast-from-aq file))
+    (message "emcp-presence: syncing %s to mDNS every %ds" file interval)))
+
+(defun emcp-presence/stop-aq-sync ()
+  "Stop the aq → mDNS sync timer and kill the publisher process."
+  (when emcp-presence/aq-sync-timer
+    (cancel-timer emcp-presence/aq-sync-timer)
+    (setq emcp-presence/aq-sync-timer nil))
+  (emcp-presence--kill-publisher)
+  (message "emcp-presence: sync stopped"))
+#+end_src
+
+* Wiring into emcp-stdio.el
+
+The four tools are registered in the same obarray walk that produces
+the 779 pure function tools, but as explicit named tools rather than
+introspected functions.  They need special handling because they have
+side effects (=broadcast=) and network calls (=discover=, =query=).
+
+#+begin_src emacs-lisp :tangle src/emcp-presence-register.el
+;;; emcp-presence-register.el — register presence tools in emcp-stdio.el
+;;; Load this after emcp-stdio.el to extend the tool registry.
+
+(require 'emcp-presence)
+
+(defvar emcp-presence/tool-definitions
+  `(("emcp-presence-discover"
+     . (:description
+        "Discover all Emacs daemons on the local network via mDNS. Returns list of peers with host, address, org-root, trust tier, and current aq presence state (task, worktree, agent, age)."
+        :input-schema
+        (:type "object" :properties () :required [])))
+
+    ("emcp-presence-broadcast"
+     . (:description
+        "Announce this agent's current work to the local network via mDNS TXT record. Updates the _emcp._tcp service advertisement with task, worktree, and agent fields. TTL is managed by avahi-daemon."
+        :input-schema
+        (:type "object"
+         :properties
+         (:task     (:type "string" :description "Short description of current work (max 120 chars)")
+          :worktree (:type "string" :description "Git worktree or project name (max 64 chars)")
+          :agent    (:type "string" :description "Agent identifier, e.g. session hash (max 32 chars)"))
+         :required ["task" "worktree" "agent"])))
+
+    ("emcp-presence-peers"
+     . (:description
+        "Return current network presence summary: active peers (ts < 5min), their tasks, worktrees, and data freshness. The Remembrance Agent uses this to know what the network is working on."
+        :input-schema
+        (:type "object" :properties () :required [])))
+
+    ("emcp-presence-query"
+     . (:description
+        "Evaluate a read-only Elisp expression on a peer's Emacs daemon discovered via mDNS. Enforces Tier 3 barrier: no shell, no delete, no personal paths. Use for org-map-entries queries against a peer's shared corpus."
+        :input-schema
+        (:type "object"
+         :properties
+         (:host (:type "string" :description "Hostname from emcp-presence-discover (without .local)")
+          :sexp (:type "string" :description "Read-only Elisp expression to evaluate"))
+         :required ["host" "sexp"]))))
+  "MCP tool definitions for emcp-presence tools.")
+
+(defun emcp-presence/handle-tool-call (name arguments)
+  "Dispatch a tool call to the appropriate emcp-presence function.
+NAME is the tool name string.  ARGUMENTS is a plist of parsed args."
+  (pcase name
+    ("emcp-presence-discover"
+     (json-encode (emcp-presence/discover)))
+
+    ("emcp-presence-broadcast"
+     (json-encode
+      (emcp-presence/broadcast
+       (plist-get arguments :task)
+       (plist-get arguments :worktree)
+       (plist-get arguments :agent))))
+
+    ("emcp-presence-peers"
+     (json-encode (emcp-presence/peers)))
+
+    ("emcp-presence-query"
+     (emcp-presence/query-peer
+      (plist-get arguments :host)
+      (plist-get arguments :sexp)))
+
+    (_ (error "emcp-presence: unknown tool %s" name))))
+#+end_src
+
+* The Full Composition
+
+With all four specs in place, the system that emerges:
+
+#+begin_src mermaid :file docs/diagrams/full-composition.png
+sequenceDiagram
+    participant CC  as Claude Code
+    participant EP  as emcp-presence
+    participant AQ  as aq NDJSON
+    participant mDNS as Avahi mDNS
+    participant D1  as minibos emcp
+    participant D2  as nexus emcp
+    participant RA  as JITIR / emcp-recall
+
+    Note over CC,RA: Agent starts working on sprint-axiom
+
+    CC->>EP: emcp-presence-broadcast\n{task:"sprint-axiom C-E009",\nworktree:"emcp",agent:"cc-a1b2"}
+    EP->>mDNS: avahi-publish TXT update\ntask=sprint-axiom C-E009
+    EP->>AQ: write NDJSON entry\n(aq bridge, optional)
+
+    Note over CC,RA: Agent needs retrieval context
+
+    CC->>EP: emcp-presence-peers
+    EP->>mDNS: avahi-browse _emcp._tcp
+    mDNS-->>EP: minibos@jwalsh (tier=1, fresh)\nnexus@jwalsh (tier=2, age=47s)
+    EP-->>CC: 2 active peers, topic: emcp
+
+    CC->>RA: trigger JITIR: "sprint-axiom"
+    RA->>EP: emcp-presence-query\n{host:"nexus",sexp:"(emcp-q/todos-by-tag \"sprint-axiom\")"}
+    EP->>D2: ssh nexus.local emacsclient --eval ...
+    D2-->>EP: 3 headings, 2 open TODO
+    EP-->>RA: structured results
+
+    RA->>D1: emcp-data-eval (local)\n(emcp-q/ego-graph sprint-axiom-id 2)
+    D1-->>RA: 8 linked nodes, clock history
+    RA-->>CC: merged context: 11 nodes,\nranked by recency + link depth
+#+end_src
+
+The RA never needed to know the address of nexus.  It asked the network
+who knows about =sprint-axiom= and the network answered.  That is the
+Remembrance Agent revival — ambient, network-aware, no static config.
+
+* Conjectures (C-F series — presence and discovery)
+
+| ID | Claim | Status |
+|-------+-------+--------|
+| C-F001 | avahi-browse discovers all =_emcp._tcp= peers on Tailscale mesh within 2 seconds | open |
+| C-F002 | mDNS TXT record updates via avahi-publish propagate to all peers within 5 seconds | open |
+| C-F003 | nss-mdns resolves =nexus.local= and =minibos.local= without Tailscale magic DNS on the LAN | open |
+| C-F004 | The 1300-byte TXT record budget is sufficient for all presence fields including a 120-char task string | open |
+| C-F005 | avahi-publish with the same service name on the same host replaces the previous record atomically | open |
+| C-F006 | The aq NDJSON → mDNS bridge (broadcast-from-aq) introduces <500ms additional latency vs direct aq file write | open |
+| C-F007 | emcp-presence-query with Tier 3 barrier correctly rejects shell-command variants including funcall-via-intern | open |
+| C-F008 | A 30-second sync interval for aq → mDNS is sufficient for the Remembrance Agent use case (staleness acceptable) | open |
+| C-F009 | Port 0 in the service record does not cause avahi-browse to filter or reject the entry | open |
+| C-F010 | The full composition (broadcast → discover → JITIR → query → merge) completes in <3 seconds on the homelab | open |
+
+* Installation
+
+** macOS (minibos)
+
+macOS has Bonjour (mDNS) built in via =dns-sd=.  Avahi is not required
+for discovery, but =avahi-browse= isn't available.  Use =dns-sd= instead:
+
+#+begin_src shell :tangle scripts/install-mdns-macos.sh :shebang "#!/usr/bin/env bash"
+# macOS: register the emcp service via dns-sd
+# Run this in background when emacs --daemon starts
+
+ORG_ROOT="${EMCP_ORG_ROOT:-$HOME/org}"
+TIER="${EMCP_TIER:-1}"
+HOST=$(hostname -s)
+USER=$(whoami)
+
+dns-sd -R "emcp@${HOST}" _emcp._tcp local 0 \
+  "v=0.1" \
+  "host=${HOST}" \
+  "user=${USER}" \
+  "org-root=${ORG_ROOT}" \
+  "tier=${TIER}" \
+  "task=" \
+  "worktree=" \
+  "agent=" \
+  "ts=0" &
+
+echo "emcp-presence: registered _emcp._tcp on ${HOST}.local"
+#+end_src
+
+#+begin_src emacs-lisp :tangle no
+;; In Emacs init.el on macOS — use dns-sd not avahi-publish
+(defun emcp-presence/broadcast-macos (task worktree agent)
+  "Broadcast presence on macOS via dns-sd."
+  (let ((ts (number-to-string (floor (float-time)))))
+    (emcp-presence--kill-publisher)
+    (setq emcp-presence/publisher-proc
+          (apply #'start-process "emcp-presence-pub" nil
+                 "dns-sd" "-R"
+                 (format "emcp@%s" (system-name))
+                 "_emcp._tcp" "local" "0"
+                 (mapcar (lambda (kv) (format "%s=%s" (car kv) (cdr kv)))
+                         `(("v" . "0.1")
+                           ("host" . ,(system-name))
+                           ("user" . ,(user-login-name))
+                           ("org-root" . ,(or emcp-t5/shared-root "~/org"))
+                           ("tier" . "1")
+                           ("task" . ,task)
+                           ("worktree" . ,worktree)
+                           ("agent" . ,agent)
+                           ("ts" . ,ts))))))))
+#+end_src
+
+** Linux (nexus / hydra — FreeBSD via Linux compat or native)
+
+#+begin_src shell :tangle scripts/install-mdns-linux.sh :shebang "#!/usr/bin/env bash"
+set -euo pipefail
+
+# Install avahi-daemon and utils
+if command -v apt-get &>/dev/null; then
+  apt-get install -y avahi-daemon avahi-utils libnss-mdns
+elif command -v pkg &>/dev/null; then
+  # FreeBSD
+  pkg install -y avahi-app nss_mdns
+fi
+
+# Configure nsswitch.conf
+if ! grep -q "mdns4_minimal" /etc/nsswitch.conf; then
+  sed -i 's/^hosts:.*/hosts: files mdns4_minimal [NOTFOUND=return] dns/' \
+    /etc/nsswitch.conf
+  echo "nsswitch.conf updated for mDNS"
+fi
+
+# Install static service file
+mkdir -p /etc/avahi/services
+cat > /etc/avahi/services/emcp.service << 'EOF'
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<service-group>
+  <name replace-wildcards="yes">emcp@%h</name>
+  <service>
+    <type>_emcp._tcp</type>
+    <port>0</port>
+    <txt-record>v=0.1</txt-record>
+    <txt-record>host=%h</txt-record>
+    <txt-record>user=jwalsh</txt-record>
+    <txt-record>org-root=/data/org</txt-record>
+    <txt-record>tier=2</txt-record>
+    <txt-record>task=</txt-record>
+    <txt-record>worktree=</txt-record>
+    <txt-record>agent=</txt-record>
+    <txt-record>ts=0</txt-record>
+  </service>
+</service-group>
+EOF
+
+systemctl enable --now avahi-daemon
+echo "avahi-daemon started, emcp service registered"
+#+end_src
+
+* Open Design Questions
+
+** Q1: avahi-publish vs static service file
+
+The static =.service= XML file registers the service with empty presence
+fields.  =avahi-publish= is called dynamically to update TXT records with
+current presence.  The question is whether avahi-publish actually
+*replaces* the static file's record or creates a second advertisement
+for the same service name.  C-F005 is the conjecture.  If it creates
+a duplicate, the design needs to be: dynamic-only (no static file) or
+update-via-D-Bus using =avahi-publish --no-daemon=.
+
+** Q2: Tailscale vs LAN scope
+
+Tailscale uses its own DNS (=*.ts.net= hostnames) and does not expose
+mDNS across machines by default.  =avahi-browse= on the Tailscale
+interface will see peers on the same Tailscale network only if the
+firewall passes UDP 5353 multicast on the Tailscale interface.  The
+simpler path: use Tailscale MagicDNS (=nexus.tail.ts.net=) for
+hostname resolution and keep mDNS for LAN-only discovery.  The two
+scopes compose: LAN = mDNS, WAN = Tailscale MagicDNS, both resolve
+via =find-file-noselect "/ssh:<host>/<path>"=.
+
+** Q3: aq TTL vs mDNS TTL
+
+aq uses a file-level TTL on NDJSON entries (entries older than TTL are
+treated as stale).  mDNS service records have their own TTL managed by
+=avahi-daemon= — typically 120 seconds, refreshed at 80% of TTL.  The
+=emcp-presence/peers= function applies a 5-minute application-level
+staleness filter on the =ts= field, independent of the mDNS TTL.  The
+question is whether the mDNS TTL should be set to match the aq TTL or
+whether they should be managed independently.  The simpler answer:
+keep them independent — mDNS handles "is the host still on the network",
+the =ts= field handles "is the presence data current."
+
+** Q4: Discovery in emcp-stdio.el vs external caller
+
+The four presence tools are currently implemented as Elisp functions
+called from within the Emacs daemon process (=emcp-stdio.el= dispatch).
+=avahi-browse= is a subprocess call.  This means the MCP call chain is:
+agent → emcp-stdio.el → avahi-browse subprocess → parse → return.
+The alternative: implement discovery in the Python =emcp_client.py=
+layer, where =subprocess.run(["avahi-browse", ...])= is more natural.
+The counter-argument: keeping everything in Elisp preserves the "Emacs
+IS the server" axiom from the parent spec.  The tiebreaker: if
+=avahi-browse= is not available (macOS without avahi), the Elisp
+implementation needs the =dns-sd= fallback anyway.  Conditionalize in
+Elisp, don't split the implementation.
