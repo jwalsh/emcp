@@ -1,0 +1,187 @@
+#+title: Banner Image Generation via Ollama + Flux
+#+subtitle: Org-mode workflow for generating project banners locally
+#+author: jwalsh
+#+date: 2026-03-19
+#+property: header-args :mkdirp t
+#+options: toc:2 num:nil
+
+* Setup
+
+** Required
+
+- Ollama with =x/flux2-klein:4b= model (5.7 GB)
+- Emacs with one of: [[https://github.com/rksm/org-ai][org-ai]], [[https://github.com/s-kostyaev/ellama][ellama]], or [[https://github.com/karthink/gptel][gptel]]
+- Alternative: direct =curl= to Ollama API
+
+** Verify model availability
+
+#+begin_src shell :results output
+ollama list | grep flux
+#+end_src
+
+** Pull model if needed
+
+#+begin_src shell :results output
+ollama pull x/flux2-klein:4b
+#+end_src
+
+* Image Generation via Ollama API
+
+Ollama serves image generation at =http://localhost:11434/api/generate=
+for vision/diffusion models.
+
+** Direct API call (no Emacs package needed)
+
+#+begin_src shell :results file :file docs/creative/banner-01.png
+curl -s http://localhost:11434/api/generate \
+  -d '{
+    "model": "x/flux2-klein:4b",
+    "prompt": "A minimalist banner for a software project called emcp. The image shows a glowing green Emacs logo (the stylized E) connected by luminous data streams to a dark terminal window showing JSON text. The style is clean, technical, dark background with green and purple accent colors. No text overlay. Wide aspect ratio 3:1.",
+    "stream": false
+  }' | python3 -c "import sys,json,base64; d=json.loads(sys.stdin.read()); open('docs/creative/banner-01.png','wb').write(base64.b64decode(d.get('response','')))" 2>/dev/null && echo "docs/creative/banner-01.png"
+#+end_src
+
+* Prompt Variants
+
+Each prompt targets a different aspect of the project. Tangle and
+run whichever resonates.
+
+** Prompt 1: "The Obarray"
+
+#+begin_example
+A vast circular array of glowing symbols floating in dark space,
+each symbol representing an Emacs Lisp function. Some symbols are
+connected by thin luminous threads (org-id links). In the center,
+a bright node labeled with a stylized lambda. Technical, abstract,
+dark background, green and amber tones. Banner aspect ratio 3:1.
+#+end_example
+
+** Prompt 2: "Emacs All The Way Down"
+
+#+begin_example
+An infinite recursive reflection: a terminal window inside a
+terminal window inside a terminal window, each showing Elisp
+code. The outermost frame has the Emacs logo. JSON-RPC messages
+flow between the layers as glowing streams. Dark, moody,
+cyberpunk aesthetic. Banner 3:1.
+#+end_example
+
+** Prompt 3: "The Data Layer"
+
+#+begin_example
+A cross-section view: at the bottom, org-mode text files as
+layered sedimentary rock. Above it, an Emacs buffer as a
+translucent database query interface. At the top, a clean MCP
+protocol message flowing upward. Geological/technical hybrid
+style. Dark background, warm amber and cool blue. Banner 3:1.
+#+end_example
+
+** Prompt 4: "Daemon Presence"
+
+#+begin_example
+Three glowing terminals on a dark network map, each running an
+Emacs daemon. Dotted lines between them represent mDNS discovery.
+Small agent icons (stylized robots) move between the terminals
+carrying org-mode heading fragments. Homelab aesthetic, warm
+lighting, technical diagram style. Banner 3:1.
+#+end_example
+
+** Prompt 5: "The Remembrance Agent"
+
+#+begin_example
+A human silhouette working at a desk with an Emacs screen. Around
+them, ghostly translucent panels show related notes, clock
+entries, and org headings floating in from the periphery — the
+Remembrance Agent surfacing context. Soft purple glow, knowledge
+graph edges visible in the background. Banner 3:1.
+#+end_example
+
+* Batch Generation Script
+
+Generate all variants:
+
+#+begin_src shell :tangle scripts/generate-banners.sh :shebang "#!/usr/bin/env bash"
+set -euo pipefail
+
+MODEL="x/flux2-klein:4b"
+OUTDIR="docs/creative"
+mkdir -p "$OUTDIR"
+
+prompts=(
+  "A minimalist banner for emcp: glowing green Emacs logo connected by luminous data streams to a terminal showing JSON. Dark background, green and purple. 3:1 ratio."
+  "Infinite recursive terminals: Elisp code inside Elisp code inside Elisp code. JSON-RPC streams between layers. Cyberpunk, dark, Emacs logo. 3:1."
+  "Cross-section: org-mode files as geological layers, Emacs buffer as database query above, MCP protocol flowing upward. Dark, amber and blue. 3:1."
+  "Three glowing terminals on a network map running Emacs daemons. mDNS discovery lines between them. Agent icons carrying org headings. Homelab aesthetic. 3:1."
+  "Human at desk with Emacs. Ghostly panels of related notes and org headings floating in from periphery. Remembrance Agent surfacing context. Purple glow. 3:1."
+)
+
+for i in "${!prompts[@]}"; do
+  n=$((i + 1))
+  echo "Generating banner-${n}..."
+  curl -s http://localhost:11434/api/generate \
+    -d "$(printf '{"model":"%s","prompt":"%s","stream":false}' "$MODEL" "${prompts[$i]}")" \
+    | python3 -c "
+import sys, json, base64
+d = json.loads(sys.stdin.read())
+resp = d.get('response', '')
+if resp:
+    open('${OUTDIR}/banner-${n}.png', 'wb').write(base64.b64decode(resp))
+    print('  -> ${OUTDIR}/banner-${n}.png')
+else:
+    print('  -> no image returned (check model)')
+" 2>/dev/null
+done
+
+echo "Done. Generated banners in ${OUTDIR}/"
+#+end_src
+
+* Elisp Integration (gptel / ellama / org-ai)
+
+** gptel with Ollama backend
+
+#+begin_src emacs-lisp :tangle no
+;; Configure gptel for Ollama image generation
+;; Note: gptel 0.9+ supports Ollama, but image gen may need
+;; custom backend configuration
+(setq gptel-backend
+      (gptel-make-ollama "ollama"
+        :host "localhost:11434"
+        :models '("x/flux2-klein:4b")
+        :stream nil))
+#+end_src
+
+** ellama with image support
+
+#+begin_src emacs-lisp :tangle no
+;; ellama can use Ollama for text; image gen requires
+;; the model to support it natively
+(require 'ellama)
+(setopt ellama-provider
+        (make-llm-ollama :chat-model "x/flux2-klein:4b"
+                         :host "localhost"
+                         :port 11434))
+#+end_src
+
+** org-ai (most flexible)
+
+#+begin_src emacs-lisp :tangle no
+;; org-ai supports multiple backends including Ollama
+;; See https://github.com/rksm/org-ai for setup
+(require 'org-ai)
+(setq org-ai-default-chat-model "x/flux2-klein:4b")
+;; Image generation in org blocks:
+;; #+begin_ai :image
+;; A banner for emcp...
+;; #+end_ai
+#+end_src
+
+* Usage Notes
+
+- Flux models need significant VRAM; the 4B parameter version is
+  the smallest viable option
+- Generation takes 30-120 seconds per image on Apple Silicon
+- The Ollama API for image generation may return base64 PNG in the
+  =response= field or in =images= array depending on version
+- If using org-babel, set =:cache yes= to avoid regenerating on
+  each export
+- Consider =:async t= for non-blocking generation in org-mode
