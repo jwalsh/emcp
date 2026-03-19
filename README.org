@@ -157,7 +157,10 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | \
 
 * Architecture
 
-#+begin_src mermaid
+See [[file:docs/diagrams/mcp-sequence.md][MCP protocol sequence diagram]] (rendered on GitHub).
+
+# +begin_comment
+#+begin_src mermaid :exports none
 sequenceDiagram
     participant Client as MCP Client
     participant Server as emcp-stdio.el
@@ -174,6 +177,7 @@ sequenceDiagram
     Daemon-->>Server: result
     Server-->>Client: result
 #+end_src
+# +end_comment
 
 ** Component Layers
 
@@ -224,7 +228,10 @@ gmake sync          # export README.org -> README.md
 
 ** Pipeline DAG
 
-#+begin_src mermaid
+See [[file:docs/diagrams/pipeline-dag.md][pipeline DAG diagram]] (rendered on GitHub).
+
+# +begin_comment
+#+begin_src mermaid :exports none
 graph TD
     A[emacs --batch -Q] --> B[obarray walk]
     B --> C[text-consumer filter]
@@ -236,6 +243,7 @@ graph TD
 
     I[emacs --daemon] -.->|optional| H
 #+end_src
+# +end_comment
 
 The full build pipeline stages:
 
@@ -262,7 +270,10 @@ full measurement data and evidence.
 
 ** Conjecture State Machine
 
-#+begin_src mermaid
+See [[file:docs/diagrams/conjecture-lifecycle.md][conjecture state machine diagram]] (rendered on GitHub).
+
+# +begin_comment
+#+begin_src mermaid :exports none
 stateDiagram-v2
     [*] --> Open: register
     Open --> Confirmed: measurement confirms
@@ -272,6 +283,7 @@ stateDiagram-v2
     Refuted --> [*]
     Indeterminate --> Open: new measurement
 #+end_src
+# +end_comment
 
 ** Conjecture Status
 
@@ -288,7 +300,10 @@ Set =EMCP_TRACE=1= to enable per-call latency and init timing instrumentation.
 
 ** Project Arc
 
-#+begin_src mermaid
+See [[file:docs/diagrams/project-arc.md][project arc gantt chart]] (rendered on GitHub).
+
+# +begin_comment
+#+begin_src mermaid :exports none
 gantt
     title From Spec to Pure Elisp — Two Sessions
     dateFormat YYYY-MM-DD
@@ -342,6 +357,7 @@ gantt
     C-010 version compat (27.1+ confirmed) :done, i7, after i5, 1h
     C-011 stdout buffering discovered      :active, i8, after h6, 1d
 #+end_src
+# +end_comment
 
 * Anti-Goals
 
