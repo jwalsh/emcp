@@ -282,10 +282,11 @@ $(BANNER_SRC):
 	  -d '{"model":"x/flux2-klein:4b","prompt":"Minimalist dark banner for emcp: glowing green Emacs logo, luminous JSON streams, dark terminal. Charcoal background, green and purple. No text.","stream":false}' \
 	  | python3 -c "import sys,json,base64; d=json.loads(sys.stdin.read()); open('$@','wb').write(base64.b64decode(d['image']))"
 
-# Crop variants (idempotent: only rebuild if source is newer)
+# Crop variants — gravity center via sips (macOS built-in)
+# Common README banner: 1200x300 (4:1) — wide, not busy
 docs/creative/banner-readme.png: $(BANNER_SRC)
-	sips -c 512 1024 $< --out /tmp/emcp-crop.png 2>/dev/null
-	sips -z 640 1280 /tmp/emcp-crop.png --out $@ 2>/dev/null
+	sips -c 256 1024 $< --out /tmp/emcp-crop.png 2>/dev/null
+	sips -z 300 1200 /tmp/emcp-crop.png --out $@ 2>/dev/null
 
 docs/creative/banner-presentation.png: $(BANNER_SRC)
 	sips -c 576 1024 $< --out /tmp/emcp-crop.png 2>/dev/null
@@ -296,8 +297,8 @@ docs/creative/banner-social.png: $(BANNER_SRC)
 	sips -z 640 1280 /tmp/emcp-crop.png --out $@ 2>/dev/null
 
 docs/creative/banner-inline.png: $(BANNER_SRC)
-	sips -c 341 1024 $< --out /tmp/emcp-crop.png 2>/dev/null
-	sips -z 200 600 /tmp/emcp-crop.png --out $@ 2>/dev/null
+	sips -c 256 1024 $< --out /tmp/emcp-crop.png 2>/dev/null
+	sips -z 200 800 /tmp/emcp-crop.png --out $@ 2>/dev/null
 
 banners: docs/creative/banner-readme.png docs/creative/banner-presentation.png docs/creative/banner-social.png docs/creative/banner-inline.png
 	@echo "Banners generated from $(BANNER_SRC)"
