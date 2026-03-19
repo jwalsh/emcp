@@ -1,0 +1,403 @@
+#+title: Implementation Plan — emcp Spec Family (JITIR, Eval, Presence, Observability)
+#+subtitle: Prioritized work items extracted from four specs, with dependency graph and axiom compliance notes
+#+author: jwalsh
+#+date: 2026-03-19
+#+options: toc:3 num:t
+
+* Summary
+
+Four new specs extend emacs-mcp-maximalist with daemon-as-retrieval-layer
+(JITIR), eval trust boundaries, agent presence/discovery via mDNS, and
+OTel observability.  Together they introduce:
+
+- *34 new conjectures* (C-D001--C-D008, C-E001--C-E010, C-F001--C-F010,
+  C-G001--C-G006) extending the existing C-001 through C-011
+- *~20 implementation tasks* across Elisp, Python, infrastructure, and docs
+- *2 axiom conflicts* that require architectural decisions before proceeding
+
+All items are registered as beads in the project tracker (~bd list~).
+
+* Axiom Compliance Review
+
+** CLAUDE.md Axiom: "The MCP server does not know what Emacs can do. Emacs tells it."
+
+The new specs are generally compliant.  The query library, eval barrier,
+presence tools, and metrics module all live in Elisp and are loaded into
+the Emacs process.  No component outside Emacs defines or augments the
+function list.
+
+** Conflict 1: =src/emcp_otel.py= — Python in the Observability Stack
+
+The =emcp-observability.org= spec introduces =src/emcp_otel.py=, a Python
+process that scrapes daemon state via =emacsclient= and exports OTel
+metrics.  This contradicts the "Python-first architecture" anti-goal in
+CLAUDE.md:
+
+#+begin_quote
+Emacs Lisp owns introspection and dispatch.  Python is the MCP protocol
+shim only.  If logic migrates from Elisp to Python, the axiom is being
+violated.
+#+end_quote
+
+*Assessment*: The OTel bridge is NOT in the MCP server path.  It is a
+sidecar that reads metrics via =emacsclient=, not a protocol shim.  The
+axiom specifically targets logic migration from Elisp to Python.
+Observability scraping is not introspection or dispatch logic.
+
+*Recommendation*: Accept Python for =emcp_otel.py= with the following
+scoping constraint: the bridge may only READ state (via =emacsclient --eval=),
+never WRITE or DISPATCH.  Document this as a deliberate exception in
+CLAUDE.md's stack preferences table.
+
+*Alternative*: Pure Elisp metrics export via =emcp-metrics/snapshot=
+(already spec'd) returning JSON that a generic OTel exporter can scrape.
+This keeps Elisp as the sole authority but requires an HTTP endpoint or
+file-based export.
+
+Bead: =emacs-mcp-maximalist-ek2=
+
+** Conflict 2: =emcp-presence/query-peer= uses =shell-command-to-string=
+
+The =emcp-presence.el= spec's =query-peer= function calls
+=shell-command-to-string= to SSH into a remote daemon.  However,
+=emcp-eval-barrier.el= blocks =shell-command-to-string= at Tier 2+.
+This is a self-referential conflict: the presence layer needs the
+exact capability the eval barrier forbids.
+
+*Recommendation*: =query-peer= should use =call-process= (which can be
+individually allowlisted in the barrier as an internal-only exception)
+or route through =emcp-t2/remote-eval= which uses =shell-command-to-string=
+internally but is a named library function, not arbitrary eval.
+
+Bead: =emacs-mcp-maximalist-pem=
+
+** Conflict 3: Spec tangle targets create files that are build artifacts
+
+Multiple specs use =:tangle yes= which would create Elisp files directly
+in =src/=.  Per CLAUDE.md, the manifest is a build artifact not committed.
+Similarly, these tangled files should be treated as generated output from
+the org specs, not committed source.  The implementation should either
+tangle-and-commit (making the org file the source of truth) or write the
+Elisp manually (making the org file documentation).
+
+*Recommendation*: Tangle-and-commit.  The org spec is the source of
+truth.  The tangled =.el= files are the implementation.  This is standard
+literate programming practice.
+
+* Priority Tiers
+
+** P0 — Do Now (extends current server directly)
+
+These require only the existing =emcp-stdio.el= and daemon infrastructure.
+They can be implemented and tested without any new dependencies.
+
+*** =src/emcp-query-library.el= — 7 query functions
+
+Bead: =emacs-mcp-maximalist-zox=
+
+Source: =emcp-jitir.org= Mode 2 and Mode 3 sections.
+
+Functions to implement:
+1. =emcp-q/todos-by-tag= — org-map-entries with tag+TODO filter
+2. =emcp-q/recently-clocked= — clock entries in last N days
+3. =emcp-q/orphaned-nodes= — org-id nodes with no incoming links
+4. =emcp-q/context-at-point= — heading hierarchy + body at file:line
+5. =emcp-q/follow-id-link= — resolve org-id and return heading+body+links
+6. =emcp-q/ego-graph= — BFS subgraph of org-id links within depth hops
+7. =emcp-q/what-was-i-doing= — clocked heading at a given timestamp
+
+These are called via =emcp-data-eval= (already implemented in
+=emcp-stdio.el=).  The library is loaded into the daemon, and the agent
+passes function calls as sexp strings.
+
+Validates conjectures: C-D002, C-D003, C-D004, C-D005, C-D006.
+
+*** =src/emcp-eval-barrier.el= — Eval safety filter
+
+Bead: =emacs-mcp-maximalist-ji7=
+
+Source: =emcp-data-eval.org= Section "The System Barrier."
+
+Components:
+- =emcp-barrier/blocked-functions= — symbol list (shell-command, delete-file, etc.)
+- =emcp-barrier/blocked-patterns= — regexp list for pattern matching
+- =emcp-barrier/safe-p= — predicate (sexp-string, tier) -> bool
+- =emcp-barrier/personal-path-p= — checks for personal path references
+
+Must be wired into =emcp-stdio.el='s =emcp-stdio--handle-tools-call= before
+=emcp-data-eval= dispatch (but does NOT modify emcp-stdio.el — loaded
+as advice or checked in daemon tool dispatch).
+
+Validates conjectures: C-E001, C-E008, C-E009, C-F007.
+
+** P1 — Next (new capabilities)
+
+These add new MCP tools and subsystems.  They depend on P0 being stable.
+
+*** =src/emcp-presence.el= — 4 MCP tools
+
+Bead: =emacs-mcp-maximalist-7c4=
+
+Source: =emcp-presence.org= Sections 4--7.
+
+Tools:
+1. =emcp-presence-discover= — avahi-browse wrapper, returns peer list
+2. =emcp-presence-broadcast= — avahi-publish wrapper, updates TXT record
+3. =emcp-presence-peers= — filtered peer list with freshness
+4. =emcp-presence-query= — eval on remote peer via SSH + emacsclient
+
+Dependencies: =emcp-eval-barrier.el= (for Tier 3 enforcement in query-peer).
+
+Validates conjectures: C-F001, C-F002, C-F005, C-F006, C-F007, C-F009, C-F010.
+
+*** =src/emcp-presence-register.el= — Tool registration
+
+Bead: =emacs-mcp-maximalist-ulj=
+
+Bridges =emcp-presence.el= functions into =emcp-stdio.el= tool registry
+format.  Loaded after =emcp-stdio.el=.
+
+*** =src/emcp-metrics.el= — In-process telemetry
+
+Bead: =emacs-mcp-maximalist-2gs=
+
+Source: =emcp-observability.org= Section "Elisp side."
+
+Components:
+- Ring buffer for eval call durations (capacity 100)
+- =emcp-metrics/record-eval= — called from eval dispatch
+- =emcp-metrics/snapshot= — returns JSON for OTel bridge scraping
+- Percentile calculation (p50, p95, p99)
+
+Validates conjectures: C-G001, C-G003.
+
+** P2 — Infrastructure
+
+These are deployment artifacts.  They require system-level configuration
+and are validated on the homelab.
+
+*** Avahi service file + install scripts
+
+Beads: =emacs-mcp-maximalist-5i1=, =emacs-mcp-maximalist-n3g=, =emacs-mcp-maximalist-8mi=
+
+- =etc/avahi/services/emcp.service= — static XML service record
+- =scripts/install-mdns-macos.sh= — dns-sd registration for macOS
+- =scripts/install-mdns-linux.sh= — avahi-daemon + nss-mdns setup
+
+Validates conjectures: C-F003, C-F004, C-F009.
+
+*** OTel bridge (Python — see Conflict 1 above)
+
+Bead: =emacs-mcp-maximalist-t7p=
+
+Source: =emcp-observability.org= Section "Python OTel exporter."
+
+=src/emcp_otel.py= — scrapes daemon state via =emacsclient=, exports to
+OTel collector.  Sidecar process, not in MCP server path.
+
+Architecture decision bead: =emacs-mcp-maximalist-ek2=
+
+*** Docker compose for Grafana stack
+
+Beads: =emacs-mcp-maximalist-8jw=, =emacs-mcp-maximalist-4jy=, =emacs-mcp-maximalist-2gk=
+
+- =docker/docker-compose.yml= — OTel collector + Prometheus + Grafana
+- =docker/otel-collector.yaml= — OTLP receiver -> Prometheus exporter
+- =grafana/alerting/emcp-alerts.yaml= — 5 alert rules
+
+Validates conjectures: C-G002, C-G005.
+
+*** Runbooks
+
+Beads: =emacs-mcp-maximalist-pho=, =emacs-mcp-maximalist-l5y=, =emacs-mcp-maximalist-kl2=
+
+- RB-001: Daemon Down (=docs/runbooks/daemon-down.md=)
+- RB-002: Broadcast Stale (=docs/runbooks/broadcast-stale.md=)
+- RB-003: No Peers (=docs/runbooks/no-peers.md=)
+
+Validates conjecture: C-G006.
+
+** P3 — Research (needs homelab)
+
+These require multi-host testing on the homelab (minibos + nexus + hydra).
+They cannot be validated on a single machine.
+
+*** TRAMP eval (Tier 2)
+
+Beads: =emacs-mcp-maximalist-60a=, =emacs-mcp-maximalist-7zm=
+
+- =src/emcp-eval-tier1.el= — full-trust local eval helpers
+- =src/emcp-eval-tier2.el= — TRAMP-based remote queries
+
+Validates conjectures: C-E002, C-E003.
+
+*** mDNS discovery (Tier 3)
+
+Bead: =emacs-mcp-maximalist-2o2=
+
+- =src/emcp-mdns.el= — avahi-browse discovery + TRAMP integration
+
+Validates conjectures: C-E004, C-E010, C-F001, C-F002, C-F003.
+
+*** Shared corpus (Tier 4)
+
+Bead: =emacs-mcp-maximalist-ssy=
+
+- =src/emcp-eval-tier4.el= — read-only queries, lock checking, safe capture
+
+Validates conjectures: C-E005, C-E006.
+
+*** Org network (Tier 5)
+
+Bead: =emacs-mcp-maximalist-5fk=
+
+- =src/emcp-eval-tier5.el= — network queries, path safety, aq presence
+
+Validates conjectures: C-E007.
+
+*** Measurement scripts
+
+Bead: =emacs-mcp-maximalist-4xf=
+
+- =src/measure_cd002.py= — eval vs sqlite-vec comparison benchmark
+
+Validates conjecture: C-D002.
+
+* Dependency Graph
+
+#+begin_src mermaid :file docs/diagrams/implementation-deps.png
+graph TD
+    subgraph P0["P0 — Do Now"]
+        QL[emcp-query-library.el\n7 query functions]
+        EB[emcp-eval-barrier.el\nstatic eval filter]
+    end
+
+    subgraph P1["P1 — Next"]
+        PR[emcp-presence.el\n4 MCP tools]
+        PRR[emcp-presence-register.el\ntool registration]
+        MET[emcp-metrics.el\nring buffer telemetry]
+    end
+
+    subgraph P2["P2 — Infrastructure"]
+        AVAHI[avahi service file\n+ install scripts]
+        OTEL[emcp_otel.py\nOTel bridge]
+        DOCKER[docker-compose.yml\nGrafana stack]
+        ALERTS[alerting rules\n+ runbooks]
+    end
+
+    subgraph P3["P3 — Research"]
+        T1[emcp-eval-tier1.el]
+        T2[emcp-eval-tier2.el]
+        T4[emcp-eval-tier4.el]
+        T5[emcp-eval-tier5.el]
+        MDNS[emcp-mdns.el]
+        MEAS[measure_cd002.py]
+    end
+
+    %% Dependencies
+    EB --> PR
+    PR --> PRR
+    MET --> OTEL
+    OTEL --> DOCKER
+    DOCKER --> ALERTS
+    PR --> AVAHI
+    EB --> T2
+    T2 --> MDNS
+    MDNS --> T4
+    T4 --> T5
+    QL --> MEAS
+
+    %% Conjecture validations
+    QL -.->|C-D002,D003,D004| CD["C-D conjectures"]
+    EB -.->|C-E001,E008,E009| CE["C-E conjectures"]
+    PR -.->|C-F001--F010| CF["C-F conjectures"]
+    MET -.->|C-G001,G003| CG["C-G conjectures"]
+    OTEL -.->|C-G002,G004| CG
+    DOCKER -.->|C-G005| CG
+
+    style P0 fill:none,stroke:#2a2
+    style P1 fill:none,stroke:#22a
+    style P2 fill:none,stroke:#a82
+    style P3 fill:none,stroke:#888,stroke-dasharray:4 4
+#+end_src
+
+* Conjecture Coverage Matrix
+
+Which implementation tasks validate which conjectures:
+
+| Implementation | Conjectures validated |
+|----------------+-----------------------|
+| emcp-query-library.el | C-D002, C-D003, C-D004, C-D005, C-D006 |
+| emcp-eval-barrier.el | C-E001, C-E008, C-E009, C-F007 |
+| emcp-presence.el | C-F001, C-F002, C-F005, C-F006, C-F007, C-F009, C-F010 |
+| emcp-metrics.el | C-G001, C-G003 |
+| emcp_otel.py | C-G002, C-G004 |
+| docker-compose.yml | C-G005 |
+| Runbooks (RB-001--003) | C-G006 |
+| emcp-eval-tier2.el | C-E002, C-E003 |
+| emcp-mdns.el | C-E004, C-E010, C-F003 |
+| emcp-eval-tier4.el | C-E005, C-E006 |
+| emcp-eval-tier5.el | C-E007 |
+| install-mdns-*.sh | C-F003, C-F004, C-F009 |
+| measure_cd002.py | C-D002 |
+
+Conjectures without a direct implementation task (validated by
+integration testing on the homelab):
+- C-D001 (graceful degradation across daemon states)
+- C-D007 (Cold daemon sufficiency for Mode 1)
+- C-D008 (unsaved buffer content impact)
+- C-F003 (nss-mdns resolution)
+- C-F004 (TXT record budget)
+- C-F008 (30s sync interval adequacy)
+
+* Architecture Decision Record: Python in Observability
+
+** Context
+
+=emcp-observability.org= specifies =src/emcp_otel.py=, a Python sidecar
+that scrapes Emacs daemon state and exports OTel metrics.  The parent
+project (CLAUDE.md) has an explicit anti-goal: "Python-first architecture."
+
+** Decision Needed
+
+Should the OTel bridge be:
+
+A. *Python (as spec'd)* — mature OTel SDK, natural subprocess/HTTP model,
+   but introduces a Python dependency outside the MCP server path.
+
+B. *Pure Elisp* — =emcp-metrics/snapshot= writes JSON to a file or HTTP
+   endpoint; a generic OTel collector scrapes it.  No Python needed.
+   Cost: must implement HTTP server in Elisp or use file-based export
+   (polling from collector).
+
+C. *Hybrid* — Elisp generates the metrics snapshot, a 20-line shell
+   script curls it to the OTel collector.  No Python, no Elisp HTTP.
+
+** Recommendation
+
+Option A (Python) with the scoping constraint that =emcp_otel.py= is
+marked as a sidecar, never loaded by =emcp-stdio.el=, and may only READ
+daemon state.  This is consistent with the axiom: Python is acceptable
+for infrastructure tooling that does not participate in MCP dispatch.
+
+** Dissent path
+
+If the team prefers pure Elisp: Option C (shell bridge) is the lowest
+cost alternative.  =emcp-metrics/snapshot= already produces the JSON;
+a cron job with =curl= pushes it.
+
+* Sequencing Recommendation
+
+1. Implement =emcp-eval-barrier.el= first (P0, security surface)
+2. Implement =emcp-query-library.el= (P0, highest user value)
+3. Wire barrier into daemon eval dispatch (requires understanding
+   =emcp-stdio.el= dispatch without modifying it — use advice or
+   a wrapper)
+4. Implement =emcp-metrics.el= (P1, low risk)
+5. Implement =emcp-presence.el= (P1, depends on barrier)
+6. Deploy Avahi service file on nexus (P2, enables P3 validation)
+7. Deploy OTel bridge + Grafana stack (P2)
+8. Begin homelab multi-host testing for P3 conjectures
+
+Total estimated effort: P0 is 2-3 sessions.  P1 is 2-3 sessions.
+P2 is 1-2 sessions.  P3 is open-ended research.

@@ -221,3 +221,79 @@ Full analysis: `docs/conjectures/c-008-research.md`.
 - **C-008**: `emacs --batch -Q -l src/emcp-stdio.el -f emcp-stdio-start` with
   JSON-RPC requests piped to stdin; tool count from `tools/list`, Unicode
   correctness via `tools/call` with non-ASCII arguments
+
+## Extended Conjectures (2026-03-19)
+
+The following 34 conjectures are introduced by four new specs in
+`docs/specs/`. They extend the C-001 through C-011 series with
+daemon-as-retrieval-layer (C-D), eval trust boundary (C-E), agent
+presence/discovery (C-F), and observability (C-G) concerns.
+
+All are registered as beads in the project tracker (`bd list`).
+
+### C-D Series — Daemon as Retrieval Layer (emcp-jitir.org)
+
+| ID | Claim | Status | Spec |
+|----|-------|--------|------|
+| C-D001 | Retrieval quality degrades gracefully across daemon states (Cold → Live), not catastrophically | open | emcp-jitir.org |
+| C-D002 | `emcp-data-eval` with `org-map-entries` outperforms sqlite-vec embedding search for tag+state queries | open | emcp-jitir.org |
+| C-D003 | org-id graph traversal via eval has lower latency than reconstructing the graph from file parse in JITIR | open | emcp-jitir.org |
+| C-D004 | Temporal queries (clock-based) are unanswerable by any retrieval system that doesn't hold org parse state | open | emcp-jitir.org |
+| C-D005 | The agent, given emcp eval access, can reconstruct a project context it has never seen without a summary document | open | emcp-jitir.org |
+| C-D006 | Eval composition (multi-step join in one call) reduces total tool calls vs ReadFile+GrepTool primitives by ≥50% | open | emcp-jitir.org |
+| C-D007 | A Cold daemon + `emcp-data-find-file` + `emcp-data-eval` is sufficient for all Mode 1 (ReadFile/GrepTool) use cases | open | emcp-jitir.org |
+| C-D008 | Unsaved buffer content (Mode 1 delta over filesystem MCP) changes agent output in ≥10% of capture-heavy sessions | open | emcp-jitir.org |
+
+### C-E Series — Eval Trust Boundary (emcp-data-eval.org)
+
+| ID | Claim | Status | Spec |
+|----|-------|--------|------|
+| C-E001 | The blocked-patterns filter produces <5% false positive rate on legitimate `org-map-entries` queries | open | emcp-data-eval.org |
+| C-E002 | TRAMP eval (Tier 2) has higher latency than local eval by >10x due to SSH handshake amortization | open | emcp-data-eval.org |
+| C-E003 | The `org-id-locations` cache on minibos correctly resolves IDs in files loaded via TRAMP from nexus | open | emcp-data-eval.org |
+| C-E004 | `avahi-browse` returns emcp peers within 500ms on the Tailscale mesh | open | emcp-data-eval.org |
+| C-E005 | Two daemons querying the same org-roam directory simultaneously produce no data corruption for read-only queries | open | emcp-data-eval.org |
+| C-E006 | The append-only capture pattern (`emcp-t4/safe-capture`) achieves conflict-free writes at <10 ops/minute | open | emcp-data-eval.org |
+| C-E007 | aq presence NDJSON as org-structured data is parseable by `emcp-t5/aq-presence-as-org` without loss | open | emcp-data-eval.org |
+| C-E008 | Adversarial bypass of `emcp-barrier/safe-p` is possible (expected: yes — document the vector) | open | emcp-data-eval.org |
+| C-E009 | A static allowlist of ~30 read-only org functions covers 90%+ of legitimate JITIR queries | open | emcp-data-eval.org |
+| C-E010 | mDNS service advertisement of `_emcp._tcp` is stable across Tailscale re-keying events | open | emcp-data-eval.org |
+
+### C-F Series — Presence and Discovery (emcp-presence.org)
+
+| ID | Claim | Status | Spec |
+|----|-------|--------|------|
+| C-F001 | `avahi-browse` discovers all `_emcp._tcp` peers on Tailscale mesh within 2 seconds | open | emcp-presence.org |
+| C-F002 | mDNS TXT record updates via `avahi-publish` propagate to all peers within 5 seconds | open | emcp-presence.org |
+| C-F003 | nss-mdns resolves `nexus.local` and `minibos.local` without Tailscale magic DNS on the LAN | open | emcp-presence.org |
+| C-F004 | The 1300-byte TXT record budget is sufficient for all presence fields including a 120-char task string | open | emcp-presence.org |
+| C-F005 | `avahi-publish` with the same service name on the same host replaces the previous record atomically | open | emcp-presence.org |
+| C-F006 | The aq NDJSON → mDNS bridge (`broadcast-from-aq`) introduces <500ms additional latency vs direct aq file write | open | emcp-presence.org |
+| C-F007 | `emcp-presence-query` with Tier 3 barrier correctly rejects `shell-command` variants including `funcall`-via-`intern` | open | emcp-presence.org |
+| C-F008 | A 30-second sync interval for aq → mDNS is sufficient for the Remembrance Agent use case (staleness acceptable) | open | emcp-presence.org |
+| C-F009 | Port 0 in the service record does not cause `avahi-browse` to filter or reject the entry | open | emcp-presence.org |
+| C-F010 | The full composition (broadcast → discover → JITIR → query → merge) completes in <3 seconds on the homelab | open | emcp-presence.org |
+
+### C-G Series — Observability (emcp-observability.org)
+
+| ID | Claim | Status | Spec |
+|----|-------|--------|------|
+| C-G001 | The 5-gauge + 4-alert set catches all 8 silent failure modes listed in the observability spec | open | emcp-observability.org |
+| C-G002 | `emcp_daemon_up` drops to 0 within 30 seconds of daemon exit | open | emcp-observability.org |
+| C-G003 | `emcp_presence_last_broadcast_age_seconds` is accurate within ±5s of actual aq file mtime | open | emcp-observability.org |
+| C-G004 | The OTel bridge adds <50ms overhead to the 15s scrape cycle | open | emcp-observability.org |
+| C-G005 | Grafana alert evaluation latency is <60s from failure to notification on the homelab stack | open | emcp-observability.org |
+| C-G006 | Runbook RB-001 resolves a daemon-down condition in <5 minutes without context switching | open | emcp-observability.org |
+
+### Measurement Protocol Notes
+
+- **C-D series**: Validated by loading `emcp-query-library.el` into a running
+  daemon and calling each function via `emcp-data-eval`. Comparison baseline
+  for C-D002 is sqlite-vec with nomic-embed-text on nexus.
+- **C-E series**: Validated by multi-host testing on the homelab. C-E001 and
+  C-E009 can be tested on a single machine with synthetic eval calls. C-E008
+  is a red-team exercise.
+- **C-F series**: Requires at least two hosts with Avahi and mDNS configured.
+  C-F004 and C-F009 can be tested locally with `avahi-publish`/`avahi-browse`.
+- **C-G series**: Requires the Docker Grafana stack running. C-G002 can be
+  tested by stopping/starting the daemon and timing the metric change.
