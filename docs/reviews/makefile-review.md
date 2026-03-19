@@ -1,4 +1,4 @@
-# Makefile Review: emacs-mcp-maximalist
+# Makefile Review: emcp
 
 **Date**: 2026-03-19
 **Reviewer**: Claude Opus 4.6 (automated)

@@ -1,11 +1,11 @@
-#+title: emacs-mcp-maximalist
+#+title: emcp
 #+subtitle: Every Text-Consuming Function in Emacs, as an MCP Tool
 #+author: jwalsh
 #+options: toc:2 num:nil
 
-[[https://github.com/jwalsh/emacs-mcp-maximalist/actions][https://img.shields.io/github/actions/workflow/status/jwalsh/emacs-mcp-maximalist/test.yml.svg?branch=main&style=flat-square&logo=github&label=tests]]
-[[https://github.com/jwalsh/emacs-mcp-maximalist/blob/main/LICENSE][https://img.shields.io/badge/license-Apache--2.0-blue.svg?style=flat-square]]
-[[https://github.com/jwalsh/emacs-mcp-maximalist/issues][https://img.shields.io/github/issues/jwalsh/emacs-mcp-maximalist.svg?style=flat-square]]
+[[https://github.com/jwalsh/emcp/actions][https://img.shields.io/github/actions/workflow/status/jwalsh/emcp/test.yml.svg?branch=main&style=flat-square&logo=github&label=tests]]
+[[https://github.com/jwalsh/emcp/blob/main/LICENSE][https://img.shields.io/badge/license-Apache--2.0-blue.svg?style=flat-square]]
+[[https://github.com/jwalsh/emcp/issues][https://img.shields.io/github/issues/jwalsh/emcp.svg?style=flat-square]]
 [[https://www.gnu.org/software/emacs/][https://img.shields.io/badge/emacs-%E2%89%A528-7F5AB6.svg?style=flat-square&logo=gnuemacs&logoColor=white]]
 
 * What
@@ -107,7 +107,7 @@ others construct the sexp from structured arguments.
       "type": "stdio",
       "command": "emacs",
       "args": ["--batch", "-Q",
-               "-l", "/path/to/emacs-mcp-maximalist/src/emcp-stdio.el",
+               "-l", "/path/to/emcp/src/emcp-stdio.el",
                "-f", "emcp-stdio-start"]
     }
   }
@@ -122,7 +122,7 @@ others construct the sexp from structured arguments.
     "emacs-mcp-elisp": {
       "command": "emacs",
       "args": ["--batch", "-Q",
-               "-l", "/path/to/emacs-mcp-maximalist/src/emcp-stdio.el",
+               "-l", "/path/to/emcp/src/emcp-stdio.el",
                "-f", "emcp-stdio-start"]
     }
   }
@@ -134,7 +134,7 @@ others construct the sexp from structured arguments.
 #+begin_src emacs-lisp
 (mcp-connect-server
  "emacs-mcp-elisp" "emacs"
- '("--batch" "-Q" "-l" "/path/to/emacs-mcp-maximalist/src/emcp-stdio.el"
+ '("--batch" "-Q" "-l" "/path/to/emcp/src/emcp-stdio.el"
    "-f" "emcp-stdio-start")
  :initial-callback (lambda (conn) (message "emacs-mcp-elisp connected"))
  :tools-callback (lambda (conn tools) (message "%d tools" (length tools))))
@@ -144,7 +144,7 @@ others construct the sexp from structured arguments.
 
 #+begin_src bash
 npx @anthropic-ai/mcp-inspector emacs --batch -Q \
-  -l /path/to/emacs-mcp-maximalist/src/emcp-stdio.el \
+  -l /path/to/emcp/src/emcp-stdio.el \
   -f emcp-stdio-start
 #+end_src
 

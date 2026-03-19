@@ -143,7 +143,7 @@ Removes all symbols from *obarray*.
 
 ---
 
-## Relevance to emacs-mcp-maximalist
+## Relevance to emcp
 
 ### The foundational mechanism: `mapatoms` over `obarray`
 

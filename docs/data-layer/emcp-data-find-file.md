@@ -93,7 +93,7 @@ string for the Elisp reader.
 
 | id | Input | Result | Notes |
 |----|-------|--------|-------|
-| 23 | `""` (empty string) | `"emacs-mcp-maximalist"` | Opened `default-directory` as dired buffer |
+| 23 | `""` (empty string) | `"emcp"` | Opened `default-directory` as dired buffer |
 | 24 | `~/nonexistent.txt` | `"nonexistent.txt"` | Tilde expanded, buffer created for new file |
 
 - **Empty string:** `find-file-noselect` receives `""`, which Emacs

@@ -6,7 +6,7 @@
 
 * Summary
 
-Four new specs extend emacs-mcp-maximalist with daemon-as-retrieval-layer
+Four new specs extend emcp with daemon-as-retrieval-layer
 (JITIR), eval trust boundaries, agent presence/discovery via mDNS, and
 OTel observability.  Together they introduce:
 
@@ -54,7 +54,7 @@ CLAUDE.md's stack preferences table.
 This keeps Elisp as the sole authority but requires an HTTP endpoint or
 file-based export.
 
-Bead: =emacs-mcp-maximalist-ek2=
+Bead: =emcp-ek2=
 
 ** Conflict 2: =emcp-presence/query-peer= uses =shell-command-to-string=
 
@@ -69,7 +69,7 @@ individually allowlisted in the barrier as an internal-only exception)
 or route through =emcp-t2/remote-eval= which uses =shell-command-to-string=
 internally but is a named library function, not arbitrary eval.
 
-Bead: =emacs-mcp-maximalist-pem=
+Bead: =emcp-pem=
 
 ** Conflict 3: Spec tangle targets create files that are build artifacts
 
@@ -93,7 +93,7 @@ They can be implemented and tested without any new dependencies.
 
 *** =src/emcp-query-library.el= — 7 query functions
 
-Bead: =emacs-mcp-maximalist-zox=
+Bead: =emcp-zox=
 
 Source: =emcp-jitir.org= Mode 2 and Mode 3 sections.
 
@@ -114,7 +114,7 @@ Validates conjectures: C-D002, C-D003, C-D004, C-D005, C-D006.
 
 *** =src/emcp-eval-barrier.el= — Eval safety filter
 
-Bead: =emacs-mcp-maximalist-ji7=
+Bead: =emcp-ji7=
 
 Source: =emcp-data-eval.org= Section "The System Barrier."
 
@@ -136,7 +136,7 @@ These add new MCP tools and subsystems.  They depend on P0 being stable.
 
 *** =src/emcp-presence.el= — 4 MCP tools
 
-Bead: =emacs-mcp-maximalist-7c4=
+Bead: =emcp-7c4=
 
 Source: =emcp-presence.org= Sections 4--7.
 
@@ -152,14 +152,14 @@ Validates conjectures: C-F001, C-F002, C-F005, C-F006, C-F007, C-F009, C-F010.
 
 *** =src/emcp-presence-register.el= — Tool registration
 
-Bead: =emacs-mcp-maximalist-ulj=
+Bead: =emcp-ulj=
 
 Bridges =emcp-presence.el= functions into =emcp-stdio.el= tool registry
 format.  Loaded after =emcp-stdio.el=.
 
 *** =src/emcp-metrics.el= — In-process telemetry
 
-Bead: =emacs-mcp-maximalist-2gs=
+Bead: =emcp-2gs=
 
 Source: =emcp-observability.org= Section "Elisp side."
 
@@ -178,7 +178,7 @@ and are validated on the homelab.
 
 *** Avahi service file + install scripts
 
-Beads: =emacs-mcp-maximalist-5i1=, =emacs-mcp-maximalist-n3g=, =emacs-mcp-maximalist-8mi=
+Beads: =emcp-5i1=, =emcp-n3g=, =emcp-8mi=
 
 - =etc/avahi/services/emcp.service= — static XML service record
 - =scripts/install-mdns-macos.sh= — dns-sd registration for macOS
@@ -188,18 +188,18 @@ Validates conjectures: C-F003, C-F004, C-F009.
 
 *** OTel bridge (Python — see Conflict 1 above)
 
-Bead: =emacs-mcp-maximalist-t7p=
+Bead: =emcp-t7p=
 
 Source: =emcp-observability.org= Section "Python OTel exporter."
 
 =src/emcp_otel.py= — scrapes daemon state via =emacsclient=, exports to
 OTel collector.  Sidecar process, not in MCP server path.
 
-Architecture decision bead: =emacs-mcp-maximalist-ek2=
+Architecture decision bead: =emcp-ek2=
 
 *** Docker compose for Grafana stack
 
-Beads: =emacs-mcp-maximalist-8jw=, =emacs-mcp-maximalist-4jy=, =emacs-mcp-maximalist-2gk=
+Beads: =emcp-8jw=, =emcp-4jy=, =emcp-2gk=
 
 - =docker/docker-compose.yml= — OTel collector + Prometheus + Grafana
 - =docker/otel-collector.yaml= — OTLP receiver -> Prometheus exporter
@@ -209,7 +209,7 @@ Validates conjectures: C-G002, C-G005.
 
 *** Runbooks
 
-Beads: =emacs-mcp-maximalist-pho=, =emacs-mcp-maximalist-l5y=, =emacs-mcp-maximalist-kl2=
+Beads: =emcp-pho=, =emcp-l5y=, =emcp-kl2=
 
 - RB-001: Daemon Down (=docs/runbooks/daemon-down.md=)
 - RB-002: Broadcast Stale (=docs/runbooks/broadcast-stale.md=)
@@ -224,7 +224,7 @@ They cannot be validated on a single machine.
 
 *** TRAMP eval (Tier 2)
 
-Beads: =emacs-mcp-maximalist-60a=, =emacs-mcp-maximalist-7zm=
+Beads: =emcp-60a=, =emcp-7zm=
 
 - =src/emcp-eval-tier1.el= — full-trust local eval helpers
 - =src/emcp-eval-tier2.el= — TRAMP-based remote queries
@@ -233,7 +233,7 @@ Validates conjectures: C-E002, C-E003.
 
 *** mDNS discovery (Tier 3)
 
-Bead: =emacs-mcp-maximalist-2o2=
+Bead: =emcp-2o2=
 
 - =src/emcp-mdns.el= — avahi-browse discovery + TRAMP integration
 
@@ -241,7 +241,7 @@ Validates conjectures: C-E004, C-E010, C-F001, C-F002, C-F003.
 
 *** Shared corpus (Tier 4)
 
-Bead: =emacs-mcp-maximalist-ssy=
+Bead: =emcp-ssy=
 
 - =src/emcp-eval-tier4.el= — read-only queries, lock checking, safe capture
 
@@ -249,7 +249,7 @@ Validates conjectures: C-E005, C-E006.
 
 *** Org network (Tier 5)
 
-Bead: =emacs-mcp-maximalist-5fk=
+Bead: =emcp-5fk=
 
 - =src/emcp-eval-tier5.el= — network queries, path safety, aq presence
 
@@ -257,7 +257,7 @@ Validates conjectures: C-E007.
 
 *** Measurement scripts
 
-Bead: =emacs-mcp-maximalist-4xf=
+Bead: =emcp-4xf=
 
 - =src/measure_cd002.py= — eval vs sqlite-vec comparison benchmark
 

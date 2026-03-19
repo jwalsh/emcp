@@ -72,12 +72,12 @@ Parsed output from the successful test:
  *code-conversion-work*
  *server*
 emcp-test-table.org	/tmp/emcp-test-table.org
-README.org	/Users/jwalsh/ghq/github.com/jwalsh/emacs-mcp-maximalist/README.org
-spec.org	/Users/jwalsh/ghq/github.com/jwalsh/emacs-mcp-maximalist/spec.org
+README.org	/Users/jwalsh/ghq/github.com/jwalsh/emcp/README.org
+spec.org	/Users/jwalsh/ghq/github.com/jwalsh/emcp/spec.org
  *Org parse*
 emcp-test-capture.org	/tmp/emcp-test-capture.org
-emcp-stdio.el	/Users/jwalsh/ghq/github.com/jwalsh/emacs-mcp-maximalist/src/emcp-stdio.el
-CLAUDE.md	/Users/jwalsh/ghq/github.com/jwalsh/emacs-mcp-maximalist/CLAUDE.md
+emcp-stdio.el	/Users/jwalsh/ghq/github.com/jwalsh/emcp/src/emcp-stdio.el
+CLAUDE.md	/Users/jwalsh/ghq/github.com/jwalsh/emcp/CLAUDE.md
 file.txt	/nonexistent/path/file.txt
 emcp-test-todo.org	/tmp/emcp-test-todo.org
 ```

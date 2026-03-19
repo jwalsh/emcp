@@ -4,7 +4,7 @@
       "command": "emacs",
       "args": ["--batch", "-Q", "-l", "src/emcp-stdio.el", "-f", "emcp-stdio-start"]
     },
-    "emacs-mcp-maximalist": {
+    "emcp-maximalist": {
       "command": "emacs",
       "args": ["--batch", "-l", "src/emcp-stdio.el", "-f", "emcp-stdio-start"]
     }

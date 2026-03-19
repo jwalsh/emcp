@@ -80,7 +80,7 @@ Moves point past the value on success. Arguments as in `json-parse-string`.
 
 ---
 
-## Relevance to emacs-mcp-maximalist
+## Relevance to emcp
 
 ### Critical path: JSON-RPC protocol
 

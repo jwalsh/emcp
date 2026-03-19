@@ -494,7 +494,7 @@ groups:
         for: 2m
         annotations:
           summary: "Emacs daemon on {{ $labels.host }} is not responding"
-          runbook_url: "https://github.com/jwalsh/emacs-mcp-maximalist/blob/main/docs/runbooks/daemon-down.md"
+          runbook_url: "https://github.com/jwalsh/emcp/blob/main/docs/runbooks/daemon-down.md"
         labels:
           severity: critical
           component: emcp-daemon
@@ -524,7 +524,7 @@ groups:
         for: 5m
         annotations:
           summary: "aq → mDNS sync has not broadcast in {{ $value | humanizeDuration }}"
-          runbook_url: "https://github.com/jwalsh/emacs-mcp-maximalist/blob/main/docs/runbooks/broadcast-stale.md"
+          runbook_url: "https://github.com/jwalsh/emcp/blob/main/docs/runbooks/broadcast-stale.md"
         labels:
           severity: warning
           component: emcp-presence
@@ -554,7 +554,7 @@ groups:
         for: 5m
         annotations:
           summary: "No active emcp peers visible on network — Remembrance Agent has no retrieval targets"
-          runbook_url: "https://github.com/jwalsh/emacs-mcp-maximalist/blob/main/docs/runbooks/no-peers.md"
+          runbook_url: "https://github.com/jwalsh/emcp/blob/main/docs/runbooks/no-peers.md"
         labels:
           severity: warning
           component: emcp-presence
@@ -584,7 +584,7 @@ groups:
         for: 5m
         annotations:
           summary: "emcp-data-eval error rate is {{ $value | humanizePercentage }}"
-          runbook_url: "https://github.com/jwalsh/emacs-mcp-maximalist/blob/main/docs/runbooks/eval-errors.md"
+          runbook_url: "https://github.com/jwalsh/emcp/blob/main/docs/runbooks/eval-errors.md"
         labels:
           severity: warning
           component: emcp-eval
@@ -614,7 +614,7 @@ groups:
         for: 10m
         annotations:
           summary: "org-id-locations not populated after 10 minutes — structural queries will return empty"
-          runbook_url: "https://github.com/jwalsh/emacs-mcp-maximalist/blob/main/docs/runbooks/org-cold.md"
+          runbook_url: "https://github.com/jwalsh/emcp/blob/main/docs/runbooks/org-cold.md"
         labels:
           severity: warning
           component: emcp-jitir
@@ -660,7 +660,7 @@ emacs --daemon
 emacsclient --eval "(emacs-pid)"
 
 # Reload emcp-stdio.el
-emacsclient --eval '(load-file "~/src/emacs-mcp-maximalist/src/emcp-stdio.el")'
+emacsclient --eval '(load-file "~/src/emcp/src/emcp-stdio.el")'
 
 # Restart presence sync if needed
 emacsclient --eval '(emcp-presence/start-aq-sync)'

@@ -1,4 +1,4 @@
-#+title: emacs-mcp-maximalist — Specification (Historical)
+#+title: emcp — Specification (Historical) [originally emacs-mcp-maximalist]
 #+subtitle: Every Text-Consuming Function in Emacs, as an MCP Tool
 #+author: aygp-dr
 #+date: 2026-03-17

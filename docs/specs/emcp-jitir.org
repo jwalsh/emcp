@@ -8,10 +8,10 @@
 #+property: header-args:mermaid :file docs/diagrams/
 #+options: toc:3 num:t
 
-* Relationship to emacs-mcp-maximalist
+* Relationship to emcp
 
 This is a *secondary spec* scoped to one use case of the emcp daemon
-data-layer tools.  It does not replace =emacs-mcp-maximalist/spec.org=.
+data-layer tools.  It does not replace =emcp/spec.org=.
 
 The parent project's axiom — the MCP server does not know what Emacs can
 do, Emacs tells it — applies here in a second register: the agent does not

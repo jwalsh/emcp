@@ -75,7 +75,7 @@ more memory consumed).
 
 ---
 
-## Relevance to emacs-mcp-maximalist
+## Relevance to emcp
 
 ### Critical for JSON-RPC stdin loop
 

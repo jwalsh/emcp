@@ -77,7 +77,7 @@ Returns the list of aliases of *coding-system*.
 
 ---
 
-## Relevance to emacs-mcp-maximalist
+## Relevance to emcp
 
 ### UTF-8 throughout the pipeline
 

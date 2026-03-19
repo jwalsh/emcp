@@ -71,7 +71,7 @@ for a full dump.
 
 This investigation is being conducted by Claude Code (Opus 4.6, 1M
 context) in a session where both `emacs-mcp-core` (60 tools) and
-`emacs-mcp-maximalist` (780 tools) are configured in `.mcp.json`. The
+`emcp` (780 tools) are configured in `.mcp.json`. The
 session is functioning normally despite 840 total MCP tools being
 available. This is direct evidence that tool definitions are not all
 injected into every LLM context window.

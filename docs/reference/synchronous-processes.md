@@ -120,7 +120,7 @@ Like `process-lines` but does not signal an error on non-zero exit.
 
 ---
 
-## Relevance to emacs-mcp-maximalist
+## Relevance to emcp
 
 ### Primary IPC mechanism: `call-process` with `emacsclient`
 

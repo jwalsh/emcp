@@ -1,0 +1,230 @@
+#+TITLE: Ollama Image Generation API Contract
+#+AUTHOR: emcp
+#+DATE: 2026-03-19
+#+PROPERTY: header-args :eval no
+
+* Overview
+
+Ollama supports experimental image generation through the standard
+=/api/generate= endpoint. The API auto-detects when an image generation
+model is being used and returns image data instead of text.
+
+This spec documents the contract for image generation, combining the
+official API documentation with empirical observations from local testing.
+
+** Status
+
+Ollama marks image generation as *experimental* and warns that the
+interface may change in future versions.
+
+* Endpoint
+
+#+begin_example
+POST /api/generate
+#+end_example
+
+Base URL (local): =http://localhost:11434/api/generate=
+
+The same endpoint serves both text completion and image generation. The
+server determines the response type based on the model's capabilities.
+
+* Request Schema
+
+** Required Fields
+
+| Field   | Type   | Description                              |
+|---------+--------+------------------------------------------|
+| =model= | string | Model name (e.g. =x/flux2-klein:4b=)    |
+| =prompt= | string | Text description of the image to generate |
+
+** Optional Fields
+
+| Field       | Type    | Default   | Description                                      |
+|-------------+---------+-----------+--------------------------------------------------|
+| =stream=    | boolean | =true=    | If =false=, return single JSON object              |
+| =options=   | object  | ={}=      | Model parameters (temperature, seed, etc.)       |
+| =keep_alive= | string  | ="5m"=    | How long to keep model loaded after request      |
+| =raw=       | boolean | =false=   | Skip prompt template formatting                  |
+
+** Experimental Image Generation Parameters
+
+These are top-level request fields (not nested under =options=).
+
+| Field    | Type    | Default | Description                          |
+|----------+---------+---------+--------------------------------------|
+| =width=  | integer | varies  | Width of generated image in pixels   |
+| =height= | integer | varies  | Height of generated image in pixels  |
+| =steps=  | integer | varies  | Number of diffusion steps            |
+
+* Response Schema
+
+** Text Models vs Image Models
+
+The response key differs based on model type:
+
+| Model Type      | Response Key | Content Type     |
+|-----------------+--------------+------------------|
+| Text completion | =response=   | Plain text string |
+| Image generation | =image=      | Base64-encoded PNG |
+
+This is the critical distinction: callers must check for =image= key
+(not =response=) when using image generation models.
+
+** Streaming Response (default)
+
+When =stream= is =true= (the default), progress updates are emitted:
+
+#+begin_src json
+{
+  "model": "x/z-image-turbo",
+  "created_at": "2024-01-15T10:30:00.000000Z",
+  "completed": 5,
+  "total": 20,
+  "done": false
+}
+#+end_src
+
+The =completed= and =total= fields track diffusion step progress.
+
+** Final Response
+
+#+begin_src json
+{
+  "model": "x/z-image-turbo",
+  "created_at": "2024-01-15T10:30:15.000000Z",
+  "image": "iVBORw0KGgoAAAANSUhEUg...",
+  "done": true,
+  "done_reason": "stop",
+  "total_duration": 15000000000,
+  "load_duration": 2000000000
+}
+#+end_src
+
+** Response Fields
+
+| Field              | Type    | Description                                |
+|--------------------+---------+--------------------------------------------|
+| =model=            | string  | Model name used                            |
+| =created_at=       | string  | ISO 8601 timestamp                         |
+| =image=            | string  | Base64-encoded PNG image data              |
+| =done=             | boolean | =true= when generation is complete          |
+| =done_reason=      | string  | Reason for completion (e.g. ="stop"=)       |
+| =total_duration=   | integer | Total time in nanoseconds                  |
+| =load_duration=    | integer | Model load time in nanoseconds             |
+
+Note: durations are in *nanoseconds*, consistent with all Ollama API
+responses.
+
+* The =stream: false= Requirement
+
+For programmatic image extraction, =stream: false= is effectively
+required. With streaming enabled:
+
+- Multiple JSON chunks are emitted (progress updates)
+- The image data only appears in the *final* chunk
+- Callers must accumulate chunks and parse the last one
+
+With =stream: false=:
+
+- A single JSON object is returned
+- The =image= key contains the complete base64 PNG
+- Simpler to parse: =json.loads(response)['image']=
+
+* Empirical Observations
+
+These are based on local testing, not guaranteed by the API contract.
+
+** Tested Model
+
+- Model: =x/flux2-klein:4b=
+- Pull: =ollama pull x/flux2-klein:4b=
+
+** Minimal Working Request
+
+#+begin_src shell
+curl -s http://localhost:11434/api/generate \
+  -d '{"model":"x/flux2-klein:4b","prompt":"a red circle on white background","stream":false}'
+#+end_src
+
+** Decode Response to File
+
+#+begin_src shell
+curl -s http://localhost:11434/api/generate \
+  -d '{"model":"x/flux2-klein:4b","prompt":"...","stream":false}' \
+  | python3 -c "
+import sys, json, base64
+d = json.loads(sys.stdin.read())
+open('output.png', 'wb').write(base64.b64decode(d['image']))
+"
+#+end_src
+
+** Output Characteristics
+
+| Property        | Observed Value             | Notes                              |
+|-----------------+----------------------------+------------------------------------|
+| Default size    | 1024x1024                  | When width/height not specified    |
+| Format          | PNG                        | Base64-decoded to valid PNG        |
+| Generation time | ~60s                       | Apple Silicon (M-series), first run |
+| Subsequent runs | ~30-45s                    | Model already loaded in memory     |
+| Aspect ratio    | Prompt cannot control      | Must use width/height params       |
+
+** Width/Height Control
+
+The =width= and =height= parameters are top-level request fields:
+
+#+begin_src shell
+curl -s http://localhost:11434/api/generate \
+  -d '{"model":"x/flux2-klein:4b","prompt":"...","stream":false,"width":1024,"height":768}'
+#+end_src
+
+Not all sizes may be supported by all models. If unsupported, the model
+may fall back to its default resolution.
+
+* Rate Limits and Timeouts
+
+Ollama is a local server with no built-in rate limiting. Practical
+limits are hardware-bound:
+
+| Constraint           | Value              | Notes                           |
+|----------------------+--------------------+---------------------------------|
+| Concurrent requests  | 1 per model        | Second request queues           |
+| Client timeout       | Set to >= 120s     | Generation can take 60s+        |
+| =keep_alive=         | 5m default         | Model stays loaded 5 minutes    |
+| Memory               | ~4-8 GB VRAM       | For 4b parameter models         |
+
+** Error Responses
+
+| HTTP Status | Condition                          | Body                                |
+|-------------+------------------------------------+-------------------------------------|
+| 200         | Success                            | JSON with =image= key              |
+| 404         | Model not found                    | ={"error": "model '...' not found"}= |
+| 500         | Server error / OOM                 | ={"error": "..."}=                  |
+
+If the model is not pulled locally, a 404 is returned. Always ensure
+=ollama pull <model>= has been run first.
+
+* Integration Pattern for Makefile
+
+The banner generation target uses this contract:
+
+#+begin_src makefile
+$(BANNER_SRC):
+	@curl -s http://localhost:11434/api/generate \
+	  -d '{"model":"x/flux2-klein:4b","prompt":"...","stream":false}' \
+	  | python3 -c "import sys,json,base64; \
+	    d=json.loads(sys.stdin.read()); \
+	    open('$@','wb').write(base64.b64decode(d['image']))"
+#+end_src
+
+Key points:
+- =stream:false= for single-object response
+- Parse =image= key (not =response=)
+- Base64-decode to binary PNG
+- Idempotent: Make only runs if target file missing
+
+* References
+
+- Ollama API docs: https://github.com/ollama/ollama/blob/main/docs/api.md
+- Ollama docs site: https://docs.ollama.com/api
+- Image generation section: marked as *Experimental*
+- flux2-klein model: =ollama pull x/flux2-klein:4b=

@@ -139,7 +139,7 @@ Removes the final newline, if any, from *string*.
 
 ---
 
-## Relevance to emacs-mcp-maximalist
+## Relevance to emcp
 
 ### Key functions used by the project
 

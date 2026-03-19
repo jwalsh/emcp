@@ -16,7 +16,7 @@ tool, and the question of what the system barrier *is* gets weirder at
 each scope level.
 
 Parent documents:
-- =emacs-mcp-maximalist/spec.org= — protocol and obarray
+- =emcp/spec.org= — protocol and obarray
 - =emcp-jitir-spec.org= — retrieval use cases, C-D conjecture series
 
 This spec addresses: what is =emcp-data-eval= allowed to do, to what,

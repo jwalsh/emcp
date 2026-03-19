@@ -1,11 +1,11 @@
 #+TITLE: Test Strategy: 800 Tools Systematic Coverage
-#+AUTHOR: emacs-mcp-maximalist
+#+AUTHOR: emcp
 #+DATE: 2026-03-18
 #+PROPERTY: header-args :eval no
 
 * Overview
 
-The emacs-mcp-maximalist server exposes ~779 tools from Emacs's =obarray=
+The emcp server exposes ~779 tools from Emacs's =obarray=
 via the text-consumer heuristic (=emcp-stdio--text-consumer-p=).  Testing
 all of them individually is impractical in a single test run.  This
 document defines a tiered strategy that achieves full coverage through

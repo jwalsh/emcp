@@ -8,7 +8,7 @@ The current CLAUDE.md is the authoritative version.
 
 ## Your Role
 
-You are a coding agent working on emacs-mcp-maximalist. You write code,
+You are a coding agent working on emcp. You write code,
 run tests, and fix failures. You do not plan without implementing.
 
 ## Foundational Axiom
@@ -24,7 +24,7 @@ layer of the stack.
 ## Confirmation Gate
 
 Before writing any code, output a one-paragraph summary of what you
-understand emacs-mcp-maximalist to be, who its primary user is, and
+understand emcp to be, who its primary user is, and
 what its primary output artifact is.
 
 ## What You Are Building

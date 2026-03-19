@@ -14,7 +14,7 @@ This is the fourth file in the emcp spec family:
 
 | File | Scope |
 |------+-------|
-| =emacs-mcp-maximalist/spec.org= | Protocol, obarray, 779 tools |
+| =emcp/spec.org= | Protocol, obarray, 779 tools |
 | =emcp-jitir.org= | Retrieval use cases, C-D conjectures |
 | =emcp-data-eval.org= | Eval contract, trust tiers, system barrier |
 | =emcp-presence.org= | *This file* — discovery, presence, aq integration |
@@ -131,7 +131,7 @@ The presence payload must fit:
 | =org-root= | 64 | =/data/org= |
 | =tier= | 2 | =2= |
 | =task= | 120 | =implementing C-E009 allowlist= |
-| =worktree= | 64 | =emacs-mcp-maximalist= |
+| =worktree= | 64 | =emcp= |
 | =agent= | 32 | =claude-code-7f3a= |
 | =ts= | 12 | =1742385600= |
 | *total* | *~362* | well within 1300 |

@@ -1,6 +1,6 @@
 #+TITLE: emcp-stdio.el --- API Quick Reference
 #+SUBTITLE: Function signatures grouped by layer
-#+AUTHOR: emacs-mcp-maximalist
+#+AUTHOR: emcp
 #+DATE: 2026-03-18
 #+OPTIONS: toc:nil num:nil ^:nil
 

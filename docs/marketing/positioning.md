@@ -1,4 +1,4 @@
-# Naming and Positioning Analysis: emacs-mcp-maximalist
+# Naming and Positioning Analysis: emcp [originally emacs-mcp-maximalist]
 
 Author: Marketing review (Emacs/open-source background)
 Date: 2026-03-19

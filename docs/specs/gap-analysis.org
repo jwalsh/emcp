@@ -680,7 +680,7 @@ decides when to retrieve; classical JITIR systems decided for the user.
 A search of GitHub (as of 2026-03) for "MCP server" + "Emacs" or
 "Elisp" yields:
 
-- *emacs-mcp-maximalist* (this project): the first known MCP server
+- *emcp** (this project): the first known MCP server
   implemented entirely in Emacs Lisp, running in batch mode.
 - *mcp.el* / various: client-side MCP integration for Emacs (calling
   MCP servers from Emacs), not servers implemented in Elisp.

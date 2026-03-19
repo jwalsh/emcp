@@ -372,7 +372,7 @@ gantt
 
 | Resource | Location |
 |---------------------------+--------------------------------------------------------|
-| Repository | [[https://github.com/jwalsh/emacs-mcp-maximalist][github.com/jwalsh/emacs-mcp-maximalist]] |
+| Repository | [[https://github.com/jwalsh/emcp][github.com/jwalsh/emcp]] |
 | Server source | [[file:../../../src/emcp-stdio.el][src/emcp-stdio.el]] |
 | Project spec | [[file:../../../CLAUDE.md][CLAUDE.md]] |
 | Conjectures | [[file:../../../CONJECTURES.md][CONJECTURES.md]] |
