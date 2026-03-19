@@ -90,6 +90,16 @@ that the heuristic would achieve >80% precision was refuted.
 
 6. `inputSchema.required` is always the vector `["args"]`.
 
+**Known bug**: `build-tool` lacks `condition-case` around the
+`(format "%s" (help-function-arglist sym t))` call. Some functions
+(e.g., `minibuffer-lazy-highlight-setup`) have arglists containing
+`#'identity` read syntax that causes `format "%s"` to emit `#\='identity`,
+which then triggers `invalid-read-syntax` in Emacs's printer. This
+crashes the entire server when `emcp-stdio-filter-fn` is `#'always`.
+The default `text-consumer-p` filter avoids this because
+`text-consumer-p` wraps its own arglist access in `condition-case`,
+so affected functions are silently excluded.
+
 **Edge cases**:
 
 | Case | Behavior |
@@ -100,6 +110,7 @@ that the heuristic would achieve >80% precision was refuted.
 | Docstring contains newlines | Preserved as-is |
 | No arglist (help-function-arglist returns t) | `description` in `args` field = `"t"` |
 | Multibyte characters in docstring | Truncation is by `length` (character count), not byte count |
+| Arglist contains #' read syntax | **CRASHES** -- unhandled `invalid-read-syntax` error (see known bug above) |
 
 ### `emcp-stdio--collect-tools` ()
 

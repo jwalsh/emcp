@@ -74,7 +74,9 @@ Set to `always' to expose every fboundp symbol (true maximalist).")
   "Build one MCP tool definition (alist) for function SYM."
   (let* ((name (symbol-name sym))
          (doc (or (ignore-errors (documentation sym t)) ""))
-         (sig (format "%s" (help-function-arglist sym t))))
+         (sig (condition-case nil
+                  (format "%s" (help-function-arglist sym t))
+                (error "()"))))
     `((name . ,name)
       (description . ,(if (> (length doc) 500)
                           (substring doc 0 500)
